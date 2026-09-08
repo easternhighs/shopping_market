@@ -9,6 +9,7 @@ import (
 type Repository interface {
 	Create(u *User) error
 	FindByUsername(username string) (*User, error)
+	FindByID(id uint) (*User, error)
 }
 
 // repository 是接口的具体实现，用 GORM 操作 MySQL。
@@ -44,6 +45,20 @@ func (r *repository) FindByUsername(username string) (*User, error) {
 	//使用替换参数的方式查询数据库中是否存在该用户名的用户，若不存在则返回nil
 	if err := r.db.Where("username=?", username).First(&user).Error; err != nil {
 		//如果错误类型是记录未找到，则返回nil,nil空值
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
+// FindByID 按用户 ID 查找用户。
+// TODO(你来实现)：用 r.db.First(&user, id) 查询；记录不存在返回 nil, nil；其他错误返回错误。
+func (r *repository) FindByID(id uint) (*User, error) {
+	var user User
+
+	if err := r.db.First(&user, id).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, nil
 		}

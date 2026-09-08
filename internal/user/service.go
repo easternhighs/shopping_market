@@ -85,11 +85,18 @@ func (s *Service) Login(username, password string) (string, error) {
 	return token, nil
 }
 
+// GetByID 按用户 ID 查询用户。
+func (s *Service) GetByID(id uint) (*User, error) {
+	return s.repo.FindByID(id)
+}
+
 // checkPassword 校验明文密码是否和加密密码匹配。
 // TODO(你来实现)：用 bcrypt.CompareHashAndPassword 比较，匹配返回 nil，不匹配返回错误。
 func checkPassword(hashedPassword, password string) error {
-	_ = bcrypt.CompareHashAndPassword
-	return errors.New("TODO: 实现密码校验")
+	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
+		return errors.New("密码错误")
+	}
+	return nil
 }
 
 // hashPassword 把明文密码加密。

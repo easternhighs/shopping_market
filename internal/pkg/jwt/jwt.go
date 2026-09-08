@@ -24,22 +24,46 @@ type Claims struct {
 
 // Generate 根据用户 ID 签发一个登录令牌。
 // TODO(你来实现)：
-//   1. 创建 Claims，设置 UserID、IssuedAt、ExpiresAt；
-//   2. 用 jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims) 创建令牌；
-//   3. 用 SignedString([]byte(secret)) 签名并返回。
+//  1. 创建 Claims，设置 UserID、IssuedAt、ExpiresAt；
+//  2. 用 jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims) 创建令牌；
+//  3. 用 SignedString([]byte(secret)) 签名并返回。
 func Generate(userID uint) (string, error) {
-	_ = jwtlib.NewWithClaims
-	_ = secret
-	_ = tokenTTL
-	return "", errors.New("TODO: 实现令牌签发")
+	//1.新建Claims对象，设置UserID、IssuedAt、ExpiresAt
+	var claims = Claims{
+		UserID: userID,
+		RegisteredClaims: jwtlib.RegisteredClaims{
+			IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			ExpiresAt: jwtlib.NewNumericDate(time.Now().Add(tokenTTL)),
+		},
+	}
+
+	//2.使用HS256算法创建一个新的令牌对象，并将Claims作为参数传入
+	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims)
+
+	//3.使用密钥对令牌进行签名，并返回签名后的令牌字符串
+	SignedToken, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", err
+	}
+
+	return SignedToken, nil
 }
 
 // Parse 解析并校验登录令牌，返回令牌里的用户 ID。
 // TODO(你来实现)：
-//   1. 用 jwtlib.ParseWithClaims 解析，传入 Claims 和密钥回调；
-//   2. 校验令牌是否有效，并取出 Claims.UserID。
+//  1. 用 jwtlib.ParseWithClaims 解析，传入 Claims 和密钥回调；
+//  2. 校验令牌是否有效，并取出 Claims.UserID。
 func Parse(tokenString string) (uint, error) {
-	_ = jwtlib.ParseWithClaims
-	_ = secret
-	return 0, errors.New("TODO: 实现令牌解析")
+	token, err := jwtlib.ParseWithClaims(tokenString, &Claims{}, func(token *jwtlib.Token) (interface{}, error) {
+		return []byte(secret), nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	//校验令牌是否有效，并取出Claims.UserID
+	if claims, ok := token.Claims.(*Claims); ok {
+		return claims.UserID, nil
+	}
+	return 0, ErrInvalidToken
 }

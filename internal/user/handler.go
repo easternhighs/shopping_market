@@ -69,3 +69,30 @@ func (h *Handler) Login(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"token": token})
 }
+
+// Me 处理 GET /me，返回当前登录用户的信息。
+func (h *Handler) Me(c *gin.Context) {
+	v, exists := c.Get(contextUserID)
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "请先登录"})
+		return
+	}
+
+	userID, ok := v.(uint)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "登录状态无效"})
+		return
+	}
+
+	u, err := h.service.GetByID(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if u == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user": u})
+}
