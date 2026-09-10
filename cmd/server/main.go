@@ -7,7 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"shopping_market/internal/config"
+	"shopping_market/internal/inventory"
 	"shopping_market/internal/pkg/db"
+	"shopping_market/internal/product"
 	"shopping_market/internal/user"
 )
 
@@ -24,8 +26,13 @@ func main() {
 	}
 
 	// 根据 User 结构体自动创建 users 表。
-	if err := dbConn.AutoMigrate(&user.User{}); err != nil {
-		log.Fatalf("创建用户表失败: %v", err)
+	if err := dbConn.AutoMigrate(
+		&user.User{},
+		&product.Product{},
+		&product.SKU{},
+		&inventory.Stock{},
+	); err != nil {
+		log.Fatalf("自动建表失败: %v", err)
 	}
 
 	r := gin.Default()
@@ -38,6 +45,18 @@ func main() {
 	userService := user.NewService(userRepo)
 	userHandler := user.NewHandler(userService)
 	user.RegisterRoutes(r, userHandler)
+
+	// 商品模块路由。
+	productRepo := product.NewRepository(dbConn)
+	productService := product.NewService(productRepo)
+	productHandler := product.NewHandler(productService)
+	product.RegisterRoutes(r, productHandler)
+
+	// 库存模块路由。
+	inventoryRepo := inventory.NewRepository(dbConn)
+	inventoryService := inventory.NewService(inventoryRepo)
+	inventoryHandler := inventory.NewHandler(inventoryService)
+	inventory.RegisterRoutes(r, inventoryHandler)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {
