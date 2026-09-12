@@ -6,8 +6,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"shopping_market/internal/cart"
 	"shopping_market/internal/config"
 	"shopping_market/internal/inventory"
+	"shopping_market/internal/order"
+	"shopping_market/internal/payment"
 	"shopping_market/internal/pkg/db"
 	"shopping_market/internal/product"
 	"shopping_market/internal/user"
@@ -31,6 +34,11 @@ func main() {
 		&product.Product{},
 		&product.SKU{},
 		&inventory.Stock{},
+		&cart.Cart{},
+		&cart.Item{},
+		&order.Order{},
+		&order.Item{},
+		&payment.Payment{},
 	); err != nil {
 		log.Fatalf("自动建表失败: %v", err)
 	}
@@ -57,6 +65,28 @@ func main() {
 	inventoryService := inventory.NewService(inventoryRepo)
 	inventoryHandler := inventory.NewHandler(inventoryService)
 	inventory.RegisterRoutes(r, inventoryHandler)
+
+	// 需要登录的接口组。
+	protected := r.Group("/")
+	protected.Use(userHandler.Auth)
+
+	// 购物车模块路由。
+	cartRepo := cart.NewRepository(dbConn)
+	cartService := cart.NewService(cartRepo)
+	cartHandler := cart.NewHandler(cartService)
+	cart.RegisterRoutes(protected, cartHandler)
+
+	// 订单模块路由。
+	orderRepo := order.NewRepository(dbConn)
+	orderService := order.NewService(orderRepo, inventoryRepo)
+	orderHandler := order.NewHandler(orderService)
+	order.RegisterRoutes(protected, orderHandler)
+
+	// 支付模块路由。
+	paymentRepo := payment.NewRepository(dbConn)
+	paymentService := payment.NewService(paymentRepo, orderService)
+	paymentHandler := payment.NewHandler(paymentService)
+	payment.RegisterRoutes(protected, paymentHandler)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {

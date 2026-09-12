@@ -14,6 +14,7 @@ type Repository interface {
 	FindBySKUID(skuID uint) (*Stock, error)
 	Deduct(skuID uint, quantity int) error
 	Create(s *Stock) error
+	DeductWithDB(db *gorm.DB, skuID uint, quantity int) error
 }
 
 // repository 是接口的具体实现，用 GORM 操作 MySQL。
@@ -74,4 +75,19 @@ func (r *repository) Deduct(skuID uint, quantity int) error {
 // Create 创建一条库存记录。
 func (r *repository) Create(s *Stock) error {
 	return r.db.Create(s).Error
+}
+
+// DeductWithDB 在指定事务里扣减库存，供订单等需要“同事务”的场景使用。
+func (r *repository) DeductWithDB(db *gorm.DB, skuID uint, quantity int) error {
+	result := db.Model(&Stock{}).
+		Where("sku_id = ? AND quantity >= ?", skuID, quantity).
+		Update("quantity", gorm.Expr("quantity - ?", quantity))
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrInsufficientStock
+	}
+	return nil
 }
