@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 
@@ -12,7 +13,10 @@ import (
 	"shopping_market/internal/order"
 	"shopping_market/internal/payment"
 	"shopping_market/internal/pkg/db"
+	kafkapkg "shopping_market/internal/pkg/kafka"
+	redispkg "shopping_market/internal/pkg/redis"
 	"shopping_market/internal/product"
+	"shopping_market/internal/seckill"
 	"shopping_market/internal/user"
 )
 
@@ -39,6 +43,9 @@ func main() {
 		&order.Order{},
 		&order.Item{},
 		&payment.Payment{},
+		&seckill.Activity{},
+		&seckill.Item{},
+		&seckill.Order{},
 	); err != nil {
 		log.Fatalf("自动建表失败: %v", err)
 	}
@@ -87,6 +94,30 @@ func main() {
 	paymentService := payment.NewService(paymentRepo, orderService)
 	paymentHandler := payment.NewHandler(paymentService)
 	payment.RegisterRoutes(protected, paymentHandler)
+
+	// 秒杀模块路由。
+	seckillRepo := seckill.NewRepository(dbConn)
+	redisClient := redispkg.New("127.0.0.1:6379")
+	if err := redisClient.Ping(context.Background()); err != nil {
+		log.Fatalf("连接 Redis 失败: %v", err)
+	}
+	kafkaBrokers := []string{"127.0.0.1:9092"}
+	kafkaTopic := "seckill_orders"
+	kafkaProducer := kafkapkg.NewProducer(kafkaBrokers, kafkaTopic)
+	kafkaConsumer := kafkapkg.NewConsumer(kafkaBrokers, kafkaTopic, "shopping_market_seckill")
+	seckillCache := seckill.NewCache(redisClient)
+	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumer)
+	seckillService := seckill.NewService(seckillRepo, seckillCache, seckillQueue)
+	seckillHandler := seckill.NewHandler(seckillService)
+	seckill.RegisterRoutes(protected, seckillHandler)
+
+	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
+	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
+	go func() {
+		if err := seckillService.ConsumeOrders(context.Background()); err != nil {
+			log.Printf("秒杀消费端退出: %v", err)
+		}
+	}()
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {
