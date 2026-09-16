@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -14,6 +15,8 @@ import (
 	"shopping_market/internal/payment"
 	"shopping_market/internal/pkg/db"
 	kafkapkg "shopping_market/internal/pkg/kafka"
+	"shopping_market/internal/pkg/metrics"
+	"shopping_market/internal/pkg/ratelimit"
 	redispkg "shopping_market/internal/pkg/redis"
 	"shopping_market/internal/product"
 	"shopping_market/internal/seckill"
@@ -51,9 +54,12 @@ func main() {
 	}
 
 	r := gin.Default()
+	appMetrics := metrics.NewMetrics()
+	r.Use(metrics.Middleware(appMetrics))
 
 	// 健康检查：用来确认服务还活着。
 	r.GET("/health", healthHandler)
+	r.GET("/metrics", gin.WrapH(appMetrics.Handler()))
 
 	// 用户模块路由。
 	userRepo := user.NewRepository(dbConn)
@@ -108,8 +114,12 @@ func main() {
 	seckillCache := seckill.NewCache(redisClient)
 	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumer)
 	seckillService := seckill.NewService(seckillRepo, seckillCache, seckillQueue)
+	seckillService.SetMetricsObserver(appMetrics.ObserveSeckill)
 	seckillHandler := seckill.NewHandler(seckillService)
-	seckill.RegisterRoutes(protected, seckillHandler)
+	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
+	seckillGroup := protected.Group("/")
+	seckillGroup.Use(ratelimit.RateLimit(seckillRateLimiter, 100, time.Second, appMetrics.ObserveRateLimited))
+	seckill.RegisterRoutes(seckillGroup, seckillHandler)
 
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
@@ -118,6 +128,9 @@ func main() {
 			log.Printf("秒杀消费端退出: %v", err)
 		}
 	}()
+
+	// 启动库存对账任务：每隔一段时间，用 MySQL 的 sold 修正 Redis 库存。
+	go seckillService.ReconcileLoop(context.Background(), 30*time.Second)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {

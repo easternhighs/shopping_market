@@ -44,6 +44,25 @@ redis.call("INCRBY", KEYS[2], quantity)
 return 1 -- 成功
 `
 
+// rollbackLuaScript 用来把一次“Redis 已经预扣、但 MySQL 最终没落库”的请求还回去。
+// KEYS[1]：Redis 剩余库存
+// KEYS[2]：该用户在该商品上的已购买数量
+// ARGV[1]：本次要回补的数量
+const rollbackLuaScript = `
+local stock = tonumber(redis.call("GET", KEYS[1]) or "0")
+local bought = tonumber(redis.call("GET", KEYS[2]) or "0")
+local quantity = tonumber(ARGV[1])
+
+if bought < quantity then
+	return -1 -- 用户已购买数量不足，不能回补
+end
+
+-- 为剩余库存加上quantity，为用户已购买数量减少quantity，当用户已购买数量不足时回补会失败
+redis.call("INCRBY", KEYS[1], quantity)
+redis.call("DECRBY", KEYS[2], quantity)
+return 1 -- 回补成功
+`
+
 // Cache 封装秒杀模块使用的 Redis 操作。
 type Cache struct {
 	client *redisclient.Client
@@ -90,4 +109,34 @@ func (c *Cache) PreDeduct(ctx context.Context, itemID, userID uint, quantity, to
 	default:
 		return errors.New("redis lua 出现未知错误")
 	}
+}
+
+// SetStock 直接设置某个秒杀商品在 Redis 中的剩余库存。
+// 对账时用它把 Redis 修正成 MySQL 计算出的正确值。
+func (c *Cache) SetStock(ctx context.Context, itemID uint, stock int) error {
+	stockKey := fmt.Sprintf("seckill:item:%d:stock", itemID)
+	return c.client.Set(ctx, stockKey, stock, 0).Err()
+}
+
+// RollbackDeduct 把一次已经预扣但最终没有落库的秒杀请求还回去。
+// 什么时候用：消费端处理 Kafka 消息失败时，MySQL 事务会回滚，但 Redis 已经扣过了；
+// 为了让两边重新对齐，需要把 Redis 库存加回来，并把用户已购买数量减回去。
+func (c *Cache) RollbackDeduct(ctx context.Context, itemID, userID uint, quantity int) error {
+	stockKey := fmt.Sprintf("seckill:item:%d:stock", itemID)
+	userKey := fmt.Sprintf("seckill:item:%d:user:%d", itemID, userID)
+
+	result, err := c.client.Eval(ctx, rollbackLuaScript, []string{stockKey, userKey}, quantity).Int()
+	if err != nil {
+		return err
+	}
+
+	switch result {
+	case -1:
+		return errors.New("用户已购买数量不足")
+	case 1:
+		return nil
+	default:
+		return errors.New("Redis出现未知错误")
+	}
+
 }

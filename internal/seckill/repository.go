@@ -12,6 +12,7 @@ type Repository interface {
 	ListActivities() ([]Activity, error)
 	CreateActivity(a *Activity) error
 	FindItemByID(id uint) (*Item, error)
+	ListItems() ([]Item, error)
 	ListItemsByActivityID(activityID uint) ([]Item, error)
 	CreateItem(i *Item) error
 	FindOrderByRequestID(requestID string) (*Order, error)
@@ -70,6 +71,15 @@ func (r *repository) FindItemByID(id uint) (*Item, error) {
 		return nil, err
 	}
 	return &item, nil
+}
+
+// ListItems 查询全部秒杀商品，供对账任务遍历使用。
+func (r *repository) ListItems() ([]Item, error) {
+	var items []Item
+	if err := r.db.Find(&items).Error; err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 // ListItemsByActivityID 查询某场活动下的全部秒杀商品。

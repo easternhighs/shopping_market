@@ -2,8 +2,14 @@ package seckill
 
 import (
 	"context"
+	"errors"
 
 	"gorm.io/gorm"
+)
+
+var (
+	ErrRequestExists = errors.New("请求已经存在")
+	ErrOrderExists   = errors.New("订单已经存在")
 )
 
 // ConsumeOrders 持续从 Kafka 读取秒杀消息，并把成功预扣的请求最终写入 MySQL。
@@ -24,8 +30,21 @@ func (s *Service) ConsumeOrders(ctx context.Context) error {
 		}
 
 		if err := s.processOrder(ctx, msg); err != nil {
+			// MySQL 事务已经回滚，这里把 Redis 预扣的部分还回去。
+			if rollbackErr := s.compensate(ctx, msg); rollbackErr != nil {
+				s.observeSeckillResult("failure")
+				return rollbackErr
+			}
+			if errors.Is(err, ErrOrderExists) || errors.Is(err, ErrRequestExists) {
+				s.observeSeckillResult("duplicate")
+				continue
+			}
+
+			s.observeSeckillResult("failure")
 			return err
 		}
+
+		s.observeSeckillResult("success")
 	}
 }
 
@@ -40,7 +59,7 @@ func (s *Service) processOrder(ctx context.Context, msg OrderMessage) error {
 			return err
 		}
 		if existingRequest != nil {
-			return nil
+			return ErrRequestExists
 		}
 
 		existingUserOrder, err := s.repo.FindOrderByUserAndItemWithTx(tx, msg.UserID, msg.ItemID)
@@ -48,7 +67,7 @@ func (s *Service) processOrder(ctx context.Context, msg OrderMessage) error {
 			return err
 		}
 		if existingUserOrder != nil {
-			return nil
+			return ErrOrderExists
 		}
 
 		if err := s.repo.DeductStock(tx, msg.ItemID, msg.Quantity); err != nil {
@@ -71,4 +90,10 @@ func (s *Service) processOrder(ctx context.Context, msg OrderMessage) error {
 	}
 
 	return nil
+}
+
+// compensate 在消息处理失败后回补 Redis。
+// 它不负责判断要不要回补，只负责把 Redis 库存和用户购买数还回去。
+func (s *Service) compensate(ctx context.Context, msg OrderMessage) error {
+	return s.cache.RollbackDeduct(ctx, msg.ItemID, msg.UserID, msg.Quantity)
 }

@@ -22,14 +22,29 @@ var (
 
 // Service 是秒杀模块的业务层。
 type Service struct {
-	repo  Repository
-	cache *Cache
-	queue *Queue
+	repo            Repository
+	cache           *Cache
+	queue           *Queue
+	metricsObserver func(kind string)
 }
 
 // NewService 创建秒杀业务层。
 func NewService(repo Repository, cache *Cache, queue *Queue) *Service {
 	return &Service{repo: repo, cache: cache, queue: queue}
+}
+
+// SetMetricsObserver 设置秒杀指标回调，可选。
+// 传入 nil 表示不统计秒杀结果。
+func (s *Service) SetMetricsObserver(fn func(kind string)) {
+	s.metricsObserver = fn
+}
+
+// observeSeckillResult 向指标系统报告一次秒杀结果。
+// kind 可以是 success、failure、duplicate。
+func (s *Service) observeSeckillResult(kind string) {
+	if s.metricsObserver != nil {
+		s.metricsObserver(kind)
+	}
 }
 
 // CreateActivity 创建一场秒杀活动。
@@ -90,6 +105,8 @@ func (s *Service) ListItems(activityID uint) ([]Item, error) {
 
 // Seckill 处理一次秒杀请求。
 func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (*Order, error) {
+	defer s.observeSeckillResult("request")
+
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
 		return nil, errors.New("requestID 不能为空")
@@ -167,7 +184,7 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 	}
 
 	//6.客户端这里先返回“排队中”的订单标识
-	order := &Order{
+	queuedOrder := &Order{
 		RequestID:  requestID,
 		ActivityID: activity.ID,
 		ItemID:     item.ID,
@@ -176,5 +193,5 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 		Quantity:   quantity,
 		Status:     "queued",
 	}
-	return order, nil
+	return queuedOrder, nil
 }
