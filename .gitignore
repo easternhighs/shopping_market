@@ -5,6 +5,10 @@
 bin/
 *.exe
 
+# 临时文件
+.tmp/
+.tmp_patch_probe.*
+
 # IDE 配置
 .idea/
 .vscode/
