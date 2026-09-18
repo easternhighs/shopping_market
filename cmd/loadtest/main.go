@@ -40,12 +40,6 @@ func main() {
 }
 
 // runLoad 启动多个 goroutine，持续请求目标地址，直到 duration 结束。
-// TODO(你来实现)：
-//  1. 创建 stop channel，并启动 concurrency 个 worker goroutine；
-//  2. 每个 worker 循环构造 *http.Request，设置 Method、Body、Authorization；
-//  3. 调用 httpClient.Do(req)，记录 statusCode、latency、err；
-//  4. 使用互斥锁把每个 requestResult 安全地追加到 results；
-//  5. duration 结束后关闭 stop，等待所有 worker 退出，返回 results。
 func runLoad(target, method, body, token string, concurrency int, duration time.Duration) []requestResult {
 	var (
 		mu      sync.Mutex
@@ -61,7 +55,6 @@ func runLoad(target, method, body, token string, concurrency int, duration time.
 		mu.Unlock()
 	}
 
-	// TODO(你来实现)
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
@@ -118,10 +111,7 @@ func runLoad(target, method, body, token string, concurrency int, duration time.
 }
 
 // printSummary 输出压测汇总：总请求数、QPS、状态码分布、P50/P95/P99。
-// TODO(你来实现)：统计 results 并打印关键指标。
 func printSummary(results []requestResult, duration time.Duration) {
-	// TODO(你来实现)
-
 	requestCount := len(results)
 	statusCodeMap := make(map[int]int)
 	var (

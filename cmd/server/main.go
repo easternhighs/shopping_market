@@ -109,10 +109,19 @@ func main() {
 	}
 	kafkaBrokers := []string{"127.0.0.1:9092"}
 	kafkaTopic := "seckill_orders"
+	kafkaGroupID := "shopping_market_seckill"
+	// 消费者数量决定消费端能开几个 goroutine 并发消费，
+	// 但它受 topic 分区数限制：1 个分区同一时刻只能有 1 个消费者在干活。
+	// 分区数由 deployments/docker-compose.yml 的 KAFKA_NUM_PARTITIONS 决定，
+	// 已经建好的 topic 要执行 `make kafka-partitions` 增加分区才会生效。
+	const kafkaConsumerCount = 6
 	kafkaProducer := kafkapkg.NewProducer(kafkaBrokers, kafkaTopic)
-	kafkaConsumer := kafkapkg.NewConsumer(kafkaBrokers, kafkaTopic, "shopping_market_seckill")
+	kafkaConsumers := make([]*kafkapkg.Consumer, 0, kafkaConsumerCount)
+	for i := 0; i < kafkaConsumerCount; i++ {
+		kafkaConsumers = append(kafkaConsumers, kafkapkg.NewConsumer(kafkaBrokers, kafkaTopic, kafkaGroupID))
+	}
 	seckillCache := seckill.NewCache(redisClient)
-	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumer)
+	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumers...)
 	seckillService := seckill.NewService(seckillRepo, seckillCache, seckillQueue)
 	seckillService.SetMetricsObserver(appMetrics.ObserveSeckill)
 	seckillHandler := seckill.NewHandler(seckillService)

@@ -23,6 +23,13 @@ type Repository interface {
 	CreateOrderWithTx(tx *gorm.DB, o *Order) error
 	Transaction(fn func(tx *gorm.DB) error) error
 	DeductStock(tx *gorm.DB, itemID uint, quantity int) error
+
+	// 下面这组是“批量落库”新增的方法：一次处理一批消息，而不是一条一条来。
+	// 单条版的方法暂时保留，改造完成后可以删掉。
+	FindOrdersByRequestIDsWithTx(tx *gorm.DB, requestIDs []string) ([]Order, error)
+	FindOrdersByUserAndItemWithTx(tx *gorm.DB, itemID uint, userIDs []uint) ([]Order, error)
+	CreateOrdersWithTx(tx *gorm.DB, orders []Order) error
+	DeductStockBatch(tx *gorm.DB, itemID uint, totalQuantity int) error
 }
 
 // repository 是接口的具体实现，用 GORM 操作 MySQL。
@@ -177,5 +184,77 @@ func (r *repository) DeductStock(tx *gorm.DB, itemID uint, quantity int) error {
 	if result.RowsAffected == 0 {
 		return ErrInsufficientStock
 	}
+	return nil
+}
+
+// FindOrdersByRequestIDsWithTx 一次查出这一批里“已经存在”的 request_id。
+//
+// 原来每条消息都要单独查一次重（N 次查询）；现在用一条 IN 查询把整批问完，
+// 网络往返从 N 次降到 1 次。查出来的记录只用来标记“哪些是重复消息”。
+func (r *repository) FindOrdersByRequestIDsWithTx(tx *gorm.DB, requestIDs []string) ([]Order, error) {
+	if len(requestIDs) == 0 {
+		return nil, nil
+	}
+
+	var orders []Order
+	if err := tx.Where("request_id IN ?", requestIDs).Find(&orders).Error; err != nil {
+		return nil, err
+	}
+	return orders, nil
+}
+
+// FindOrdersByUserAndItemWithTx 一次查出“这批用户里已经买过这个商品”的记录，
+// 用来在批量落库前筛掉会触发限购的消息。
+func (r *repository) FindOrdersByUserAndItemWithTx(tx *gorm.DB, itemID uint, userIDs []uint) ([]Order, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+
+	var orders []Order
+	if err := tx.Where("item_id = ? AND user_id IN ?", itemID, userIDs).Find(&orders).Error; err != nil {
+		return nil, err
+	}
+	return orders, nil
+}
+
+// CreateOrdersWithTx 在事务里批量插入订单。
+//
+// GORM 的 Create 传入切片时会自动拼成一条
+// INSERT INTO seckill_orders (...) VALUES (...),(...),(...)，
+// 所以 200 条订单只要一次网络往返、一次写盘，而不是 200 次。
+func (r *repository) CreateOrdersWithTx(tx *gorm.DB, orders []Order) error {
+	if len(orders) == 0 {
+		return nil
+	}
+	return tx.Create(&orders).Error
+}
+
+// DeductStockBatch 在事务里一次性扣掉“某个秒杀商品”在这一批里卖出的全部数量。
+//
+// 这是本轮优化的核心：原来 N 条消息要 UPDATE 同一行 N 次，每次都要抢行锁；
+// 现在整批只 UPDATE 一次，行锁也只抢 1 次。
+//
+// 和单条版 DeductStock 唯一的区别就是数量：这里加的是整批的 totalQuantity，
+// 条件里的“卖完不超卖”也一起按总量判断。
+func (r *repository) DeductStockBatch(tx *gorm.DB, itemID uint, totalQuantity int) error {
+	if totalQuantity <= 0 {
+		return nil
+	}
+
+	result := tx.Model(&Item{}).Where("id = ? AND sold + ? <= total_stock", itemID, totalQuantity).Update("sold", gorm.Expr("sold + ?", totalQuantity))
+
+	// 先看 SQL 本身有没有报错（比如连接断了、表不存在）。
+	// 少了这一步，出错的 RowsAffected 也是 0，就会被误判成“库存不足”，
+	// 真正的原因被掩盖，排查问题时会很痛苦。
+	if result.Error != nil {
+		return result.Error
+	}
+
+	// RowsAffected 为 0 有两种可能：商品不存在，或者加上这一批就超过总库存了。
+	// 对秒杀来说两种都按“库存不足”处理——宁可不卖，也绝不超卖。
+	if result.RowsAffected == 0 {
+		return ErrInsufficientStock
+	}
+
 	return nil
 }

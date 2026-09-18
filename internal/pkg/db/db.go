@@ -2,6 +2,7 @@ package db
 
 import (
 	"log"
+	"time"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -19,6 +20,23 @@ func Connect() (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 连接池配置：限制同时最多打开多少条数据库连接，避免高并发时把 MySQL 的连接数打满；
+	// 同时保留一部分空闲连接复用，省掉每次新建连接的开销。
+	dataBase, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		MaxOpenConns    int           = 100
+		MaxIdleConns    int           = 50
+		ConnMaxLifeTime time.Duration = time.Hour
+	)
+
+	dataBase.SetMaxOpenConns(MaxOpenConns)
+	dataBase.SetMaxIdleConns(MaxIdleConns)
+	dataBase.SetConnMaxLifetime(ConnMaxLifeTime)
 
 	log.Println("已连接 MySQL")
 	return db, nil

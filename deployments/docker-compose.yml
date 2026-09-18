@@ -11,6 +11,9 @@ services:
       MYSQL_ROOT_PASSWORD: root
       # 启动时自动创建的数据库名字。
       MYSQL_DATABASE: shopping_market
+    # 提高 MySQL 允许的最大连接数。默认值是 151，高并发压测时连接会被打满，
+    # 之后出现 “dial tcp 127.0.0.1:3307: refused”。
+    command: ["--max_connections=500"]
     ports:
       # 把容器里的 3306 端口映射到本机 3307，之后 Go 程序连 localhost:3307。
       # 使用 3307 是为了避免和本机已有的 3306 服务冲突。
@@ -60,6 +63,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # 自动创建 topic 时的默认分区数。
+      # 分区是“并行消费的上限”：1 个分区同一时刻只能有 1 个消费者在处理，
+      # 所以想让消费端 6 个 goroutine 都干活，分区数就不能少于 6。
+      # 注意：这个配置只对“新建的” topic 生效；seckill_orders 已经建好了，
+      # 要给老 topic 加分区请执行 `make kafka-partitions`。
+      KAFKA_NUM_PARTITIONS: "6"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
