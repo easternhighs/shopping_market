@@ -12,3 +12,6 @@ bin/
 # IDE 配置
 .idea/
 .vscode/
+
+#agent
+AGENTS.md
