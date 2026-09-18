@@ -23,10 +23,6 @@ type Claims struct {
 }
 
 // Generate 根据用户 ID 签发一个登录令牌。
-// TODO(你来实现)：
-//  1. 创建 Claims，设置 UserID、IssuedAt、ExpiresAt；
-//  2. 用 jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims) 创建令牌；
-//  3. 用 SignedString([]byte(secret)) 签名并返回。
 func Generate(userID uint) (string, error) {
 	//1.新建Claims对象，设置UserID、IssuedAt、ExpiresAt
 	var claims = Claims{
@@ -50,9 +46,6 @@ func Generate(userID uint) (string, error) {
 }
 
 // Parse 解析并校验登录令牌，返回令牌里的用户 ID。
-// TODO(你来实现)：
-//  1. 用 jwtlib.ParseWithClaims 解析，传入 Claims 和密钥回调；
-//  2. 校验令牌是否有效，并取出 Claims.UserID。
 func Parse(tokenString string) (uint, error) {
 	token, err := jwtlib.ParseWithClaims(tokenString, &Claims{}, func(token *jwtlib.Token) (interface{}, error) {
 		return []byte(secret), nil

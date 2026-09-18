@@ -23,7 +23,6 @@ func NewRepository(db *gorm.DB) Repository {
 }
 
 // Create 把新用户保存到 users 表。
-// TODO(你来实现)：调用 r.db.Create(u) 保存用户，并把它的错误返回。
 func (r *repository) Create(u *User) error {
 	//使用r.db.Create(u)将用户保存到数据库中
 	if err := r.db.Create(u).Error; err != nil {
@@ -34,11 +33,6 @@ func (r *repository) Create(u *User) error {
 }
 
 // FindByUsername 按用户名查找用户。
-// TODO(你来实现)：
-//  1. 先声明一个 user 变量；
-//  2. 用 r.db.Where("username = ?", username).First(&user) 查询；
-//  3. 如果记录不存在（gorm.ErrRecordNotFound），返回 nil, nil；
-//  4. 其他错误要把错误返回出来。
 func (r *repository) FindByUsername(username string) (*User, error) {
 	var user User
 
@@ -54,7 +48,6 @@ func (r *repository) FindByUsername(username string) (*User, error) {
 }
 
 // FindByID 按用户 ID 查找用户。
-// TODO(你来实现)：用 r.db.First(&user, id) 查询；记录不存在返回 nil, nil；其他错误返回错误。
 func (r *repository) FindByID(id uint) (*User, error) {
 	var user User
 

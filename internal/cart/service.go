@@ -13,10 +13,6 @@ func NewService(repo Repository) *Service {
 }
 
 // AddItem 往用户购物车里加一个 SKU。
-// TODO(你来实现)：
-//  1. 查找用户的购物车，没有就创建一个；
-//  2. 查找购物车里是否已有这个 SKU；
-//  3. 如果已有，就把数量加上去；如果没有，就新增一条明细。
 func (s *Service) AddItem(userID, skuID uint, quantity int) (*Item, error) {
 	//拒绝添加数量小于等于0的商品
 	if quantity <= 0 {

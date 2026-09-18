@@ -91,7 +91,6 @@ func (s *Service) GetByID(id uint) (*User, error) {
 }
 
 // checkPassword 校验明文密码是否和加密密码匹配。
-// TODO(你来实现)：用 bcrypt.CompareHashAndPassword 比较，匹配返回 nil，不匹配返回错误。
 func checkPassword(hashedPassword, password string) error {
 	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
 		return errors.New("密码错误")
@@ -100,8 +99,6 @@ func checkPassword(hashedPassword, password string) error {
 }
 
 // hashPassword 把明文密码加密。
-// TODO(你来实现)：用 bcrypt.GenerateFromPassword 生成加密结果并返回。
-// 提示：bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 func hashPassword(password string) (string, error) {
 	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {

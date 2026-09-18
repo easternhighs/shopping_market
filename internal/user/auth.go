@@ -13,11 +13,6 @@ import (
 const contextUserID = "userID"
 
 // Auth 是登录鉴权中间件：从请求头里取出令牌，解析出用户 ID。
-// TODO(你来实现)：
-//  1. 用 c.GetHeader("Authorization") 取请求头；
-//  2. 判断它以 "Bearer " 开头，并去掉前缀得到令牌；
-//  3. 调用 jwt.Parse(token) 得到 userID；
-//  4. 失败返回 401，成功用 c.Set(contextUserID, userID) 后调用 c.Next()。
 func (h *Handler) Auth(c *gin.Context) {
 	//1.获取请求头中的Authorization字段
 	authHeader := c.GetHeader("Authorization")

@@ -41,10 +41,6 @@ func (r *repository) FindBySKUID(skuID uint) (*Stock, error) {
 
 // Deduct 扣减库存数量。
 // 这是以后“防超卖”的关键函数，必须保证“库存够才扣”。
-// TODO(你来实现)：
-//  1. 用条件更新：库存数量减去 quantity，条件是 sku_id 匹配且 quantity >= 要扣的数量；
-//  2. 如果受影响行数为 0，说明库存不足，返回一个错误；
-//  3. 其他数据库错误也要返回。
 func (r *repository) Deduct(skuID uint, quantity int) error {
 	stock, err := r.FindBySKUID(skuID)
 	if err != nil {

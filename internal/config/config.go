@@ -25,10 +25,6 @@ type HTTPConfig struct {
 }
 
 // Load 负责读取配置。
-//
-// TODO(你来实现)：读取配置并填充 Config。
-// 最简单做法：把 HTTP.Addr 赋值为 ":8080" 后返回。
-// 进阶做法：从环境变量或 config.yaml 读取，暂时没有配置文件时用默认值。
 func Load() (*Config, error) {
 	data, err := os.ReadFile(ConfigPath)
 

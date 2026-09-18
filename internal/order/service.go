@@ -33,14 +33,6 @@ func NewService(repo Repository, inventory inventory.Repository) *Service {
 }
 
 // Place 创建订单。
-// TODO(你来实现)：完成“幂等检查 + 事务下单”。
-// 流程：
-//  1. 参数校验：requestID 和 items 不能为空，每个 quantity 大于 0；
-//  2. 幂等检查：用 repo.FindByRequestID 查询，已存在就直接返回该订单；
-//  3. 用 repo.Transaction 开启事务，在事务里：
-//     a. 遍历 items，调用 inventory.DeductWithDB(tx, item.SKUID, item.Quantity) 扣库存；
-//     b. 创建订单（RequestID、UserID、Status 用 "pending"）；
-//     c. 把 items 转成 []Item 并创建明细。
 func (s *Service) Place(userID uint, requestID string, items []PlaceItem) (*Order, error) {
 	requestID = strings.TrimSpace(requestID)
 
@@ -133,10 +125,6 @@ func (s *Service) Get(id uint) (*Order, []Item, error) {
 }
 
 // Pay 把订单状态改成 paid。
-// TODO(你来实现)：完成“订单支付状态流转”：
-//  1. 查询订单，订单不存在返回 ErrOrderNotFound；
-//  2. 只有 pending 状态的订单才能支付，其他状态返回错误；
-//  3. 调用 repo.UpdateStatus 把状态改成 paid。
 func (s *Service) Pay(orderID uint) error {
 	o, err := s.repo.FindByID(orderID)
 	if err != nil {
@@ -158,10 +146,6 @@ func (s *Service) Pay(orderID uint) error {
 }
 
 // Cancel 把订单状态改成 cancelled。
-// TODO(你来实现)：完成“订单取消状态流转”：
-//  1. 查询订单，订单不存在返回 ErrOrderNotFound；
-//  2. 只有 pending 状态的订单才能取消，其他状态返回错误；
-//  3. 调用 repo.UpdateStatus 把状态改成 cancelled。
 func (s *Service) Cancel(orderID uint) error {
 	o, err := s.repo.FindByID(orderID)
 	if err != nil {

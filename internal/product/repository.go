@@ -27,7 +27,6 @@ func (r *repository) Create(p *Product) error {
 }
 
 // FindByID 按 ID 查询商品。
-// TODO(你来实现)：用 r.db.First(&product, id) 查询；查不到返回 nil, nil；其他错误返回错误。
 func (r *repository) FindByID(id uint) (*Product, error) {
 	var product Product
 
@@ -42,7 +41,6 @@ func (r *repository) FindByID(id uint) (*Product, error) {
 }
 
 // List 查询全部商品。
-// TODO(你来实现)：用 r.db.Find(&products) 查询并返回；错误要返回出来。
 func (r *repository) List() ([]Product, error) {
 	// 声明一个 products 切片，用于存储多个商品记录
 	var products []Product
