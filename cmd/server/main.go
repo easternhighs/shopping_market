@@ -33,6 +33,9 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
+	// 需要做性能分析时，设置环境变量 ENABLE_PPROF=1 再启动（见 pprof.go）。
+	enableProfilingIfRequested()
+
 	// 连接 MySQL。
 	dbConn, err := db.Connect()
 	if err != nil {
@@ -142,11 +145,16 @@ func main() {
 	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumers...)
 	seckillService := seckill.NewService(seckillRepo, seckillCache, seckillQueue)
 	seckillService.SetMetricsObserver(appMetrics.ObserveSeckill)
+	// 抢购接口的限流在 Redis 脚本里完成，中间件看不到，所以由业务层主动上报指标。
+	seckillService.SetRateLimitObserver(appMetrics.ObserveRateLimited)
 	seckillHandler := seckill.NewHandler(seckillService)
 	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
+	// 限流中间件只挂在秒杀的管理类接口上（建活动、查活动、建商品）。
+	// 抢购接口不带中间件：它的限流和库存扣减共用同一次 Redis 往返，
+	// 再套一层中间件就等于把刚省下来的往返又加回去（见 internal/seckill/cache.go 的 hotPathLuaScript）。
 	seckillGroup := protected.Group("/")
 	seckillGroup.Use(ratelimit.RateLimit(seckillRateLimiter, 100, time.Second, appMetrics.ObserveRateLimited))
-	seckill.RegisterRoutes(seckillGroup, seckillHandler)
+	seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
 
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。

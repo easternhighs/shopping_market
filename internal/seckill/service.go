@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -39,14 +38,17 @@ var (
 	ErrActivityNotStarted = errors.New("秒杀活动尚未开始")
 	// ErrActivityEnded 表示秒杀活动已结束（→ 409）。
 	ErrActivityEnded = errors.New("秒杀活动已结束")
+	// ErrRateLimited 表示这个用户在当前时间窗口内请求太频繁（→ 429）。
+	ErrRateLimited = errors.New("抢购请求过于频繁")
 )
 
 // Service 是秒杀模块的业务层。
 type Service struct {
-	repo            Repository
-	cache           *Cache
-	queue           *Queue
-	metricsObserver func(kind string)
+	repo              Repository
+	cache             *Cache
+	queue             *Queue
+	metricsObserver   func(kind string)
+	rateLimitObserver func()
 }
 
 // NewService 创建秒杀业务层。
@@ -65,6 +67,19 @@ func (s *Service) SetMetricsObserver(fn func(kind string)) {
 func (s *Service) observeSeckillResult(kind string) {
 	if s.metricsObserver != nil {
 		s.metricsObserver(kind)
+	}
+}
+
+// SetRateLimitObserver 设置限流指标回调，可选。
+// 抢购接口的限流发生在 Redis 脚本内部，中间件看不到，所以要由业务层主动上报。
+func (s *Service) SetRateLimitObserver(fn func()) {
+	s.rateLimitObserver = fn
+}
+
+// observeRateLimited 向指标系统报告一次被限流的请求。
+func (s *Service) observeRateLimited() {
+	if s.rateLimitObserver != nil {
+		s.rateLimitObserver()
 	}
 }
 
@@ -124,7 +139,23 @@ func (s *Service) ListItems(activityID uint) ([]Item, error) {
 	return s.repo.ListItemsByActivityID(activityID)
 }
 
+// rateLimitPerUser 和 rateLimitWindow 是抢购接口对单个用户的限流阈值。
+//
+// 为什么限流放在 Redis 脚本里，而不是像其他接口那样放在中间件里：
+// 中间件的限流计数是一次独立的 Redis 往返；放进脚本后，它跟扣减共用同一次往返，
+// 等于「限流」这件事不再额外花 RTT。
+// 代价是限流维度从 IP 变成了用户——抢购接口必须登录，按用户限流反而更准
+// （同一个人换 IP 也躲不掉），而 IP 维度的防护仍然由秒杀管理接口的中间件负责。
+const (
+	rateLimitPerUser = 100
+	rateLimitWindow  = time.Second
+)
+
 // Seckill 处理一次秒杀请求。
+//
+// 热路径只有一次 Redis 往返：限流、读缓存、校验活动时间、防重、限购、预扣库存
+// 全部在同一个 Lua 脚本里完成（见 cache.go 的 hotPathLuaScript）。
+// 只有 Redis 里还没有这个商品的缓存时，才会回源 MySQL 填充缓存后重试一次。
 func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (*Order, error) {
 	defer s.observeSeckillResult("request")
 
@@ -136,71 +167,38 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 		return nil, fmt.Errorf("%w: 抢购数量必须大于 0", ErrInvalidRequest)
 	}
 
-	//2.查询秒杀商品和活动，校验活动时间
 	ctx := context.Background()
+	req := FastPathRequest{
+		RequestID:  requestID,
+		ItemID:     itemID,
+		UserID:     userID,
+		Quantity:   quantity,
+		Now:        time.Now(),
+		RateLimit:  rateLimitPerUser,
+		RateWindow: rateLimitWindow,
+	}
 
-	// 缓存优先（cache-aside）：
-	//   1) 先问 Redis 有没有商品信息；
-	//   2) Redis 未命中（redis.Nil）时再回源 MySQL，并把结果写回 Redis，下次就快了；
-	//   3) 其他 Redis 错误直接返回，避免拿不确定的数据继续下单。
-	// 好处：秒杀高峰时大多数请求不再查 MySQL，数据库压力大幅下降。
-	item, err := s.cache.GetItem(ctx, itemID)
-	if errors.Is(err, redis.Nil) {
-		item, err = s.repo.FindItemByID(itemID)
-		if err != nil {
-			return nil, err
+	item, err := s.cache.TrySeckill(ctx, req)
+	if errors.Is(err, errCacheNotReady) {
+		// 冷路径：Redis 里没有这个商品的信息（第一次抢、缓存过期、或者服务刚重启）。
+		// 回源 MySQL 把缓存补齐，然后重试一次；仍然失败就交给下面统一处理。
+		if warmErr := s.warmUpCache(ctx, itemID); warmErr != nil {
+			return nil, warmErr
 		}
-		if item == nil {
-			return nil, ErrItemNotFound
+		req.Now = time.Now()
+		item, err = s.cache.TrySeckill(ctx, req)
+	}
+	if err != nil {
+		if errors.Is(err, ErrRateLimited) {
+			s.observeRateLimited()
 		}
-		// 写回缓存失败不影响本次下单，因此这里忽略错误（下同）。
-		_ = s.cache.SetItem(ctx, item)
-	} else if err != nil {
-		return nil, err
-	} else if item == nil {
-		return nil, ErrItemNotFound
-	}
-
-	// 活动信息同理：先查缓存，未命中再回源 MySQL 并写回。
-	activity, err := s.cache.GetActivity(ctx, item.ActivityID)
-	if errors.Is(err, redis.Nil) {
-		activity, err = s.repo.FindActivityByID(item.ActivityID)
-		if err != nil {
-			return nil, err
-		}
-		if activity == nil {
-			return nil, ErrActivityNotFound
-		}
-		_ = s.cache.SetActivity(ctx, activity)
-	} else if err != nil {
-		return nil, err
-	} else if activity == nil {
-		return nil, ErrActivityNotFound
-	}
-
-	//校验活动时间
-	now := time.Now()
-	if now.Before(activity.StartAt) {
-		return nil, ErrActivityNotStarted
-	}
-	if now.After(activity.EndAt) {
-		return nil, ErrActivityEnded
-	}
-
-	//3.把“requestID 防重、用户限购、库存预扣”合并到一次 Redis 原子操作。
-	// 优化目的：高并发时不再先访问两次 MySQL，减少数据库连接池压力。
-	if quantity > item.PerUserLimit {
-		return nil, ErrPerUserLimitExceeded
-	}
-
-	if err := s.cache.CheckAndPreDeduct(ctx, requestID, itemID, userID, quantity, item.TotalStock, item.PerUserLimit); err != nil {
 		return nil, err
 	}
 
-	//4.成功后发送 Kafka 消息，由消费端最终创建 MySQL 订单
+	// 预扣成功，把这次抢购交给 Kafka 排队，由消费端最终写进 MySQL。
 	message := OrderMessage{
 		RequestID:  requestID,
-		ActivityID: activity.ID,
+		ActivityID: item.ActivityID,
 		ItemID:     item.ID,
 		SKUID:      item.SKUID,
 		UserID:     userID,
@@ -210,17 +208,40 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 		return nil, err
 	}
 
-	//5.客户端这里先返回“排队中”的订单标识
-	queuedOrder := &Order{
+	// 客户端这里先返回“排队中”的订单标识
+	return &Order{
 		RequestID:  requestID,
-		ActivityID: activity.ID,
+		ActivityID: item.ActivityID,
 		ItemID:     item.ID,
 		SKUID:      item.SKUID,
 		UserID:     userID,
 		Quantity:   quantity,
 		Status:     "queued",
+	}, nil
+}
+
+// warmUpCache 回源 MySQL 读出秒杀商品和它所属的活动，写进 Redis 供热路径使用。
+// 它只在热路径报告「缓存没准备好」时被调用，属于低频的冷路径。
+func (s *Service) warmUpCache(ctx context.Context, itemID uint) error {
+	item, err := s.repo.FindItemByID(itemID)
+	if err != nil {
+		return err
 	}
-	return queuedOrder, nil
+	if item == nil {
+		return ErrItemNotFound
+	}
+
+	activity, err := s.repo.FindActivityByID(item.ActivityID)
+	if err != nil {
+		return err
+	}
+	if activity == nil {
+		return ErrActivityNotFound
+	}
+
+	// 写缓存失败不影响本次下单：这次照样往下走，下次再走一遍冷路径即可。
+	_ = s.cache.WarmUp(ctx, item, activity)
+	return nil
 }
 
 // BatchResult 是一批消息“处理完之后各自的下场”。

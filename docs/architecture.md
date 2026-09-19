@@ -22,7 +22,7 @@ flowchart LR
     end
 
     subgraph Server["Go 单体服务 cmd/server，监听 :8080"]
-        MW["中间件链<br/>metrics 统计 → JWT 鉴权 → 限流（仅秒杀路由）"]
+        MW["中间件链<br/>metrics 统计 → JWT 鉴权 → 限流（仅秒杀管理接口）"]
         BIZ["7 个业务模块<br/>user / product / inventory<br/>cart / order / payment / seckill"]
         CONSUMER["秒杀消费端<br/>6 个 goroutine × 6 个消费者"]
         RECON["对账任务<br/>每 30 秒跑一次"]
@@ -101,22 +101,20 @@ sequenceDiagram
     participant M as MySQL
 
     U->>G: POST /seckill/items/14/orders
-    Note over G: JWT 鉴权<br/>限流：单 IP 每秒 100 次，超出返回 429
+    Note over G: 只做 JWT 鉴权<br/>限流已经并进下面那一次 Lua，不再单独占一次往返
 
-    G->>R: GET seckill:item:14:info（cache-aside 第一步）
-    alt 缓存未命中
-        G->>M: SELECT seckill_items WHERE id = 14
-        G->>R: SET seckill:item:14:info（TTL 5 分钟）
+    G->>R: EVAL hotPathLuaScript（整条抢购链路只此一次往返）
+    Note over R: ① 限流：单用户每秒 100 次<br/>② 读商品信息 + 活动时间窗<br/>③ 校验活动是否在开始~结束之内<br/>④ requestID 是否已存在<br/>⑤ 库存够不够、该用户是否超限购<br/>⑥ 扣减库存、累加已买、写 requestID 标记
+    alt 返回 -5（缓存没准备好）
+        R-->>G: -5
+        G->>M: SELECT seckill_items + seckill_activities
+        G->>R: WarmUp：写入 :info 与 :window（TTL 5 分钟）
+        G->>R: EVAL hotPathLuaScript（重试一次）
     end
-    G->>R: GET seckill:activity:{id}:info
-    Note over G: 校验活动是否在开始~结束时间之内
-
-    G->>R: EVAL checkAndPreDeductLua（一次原子操作）
-    Note over R: ① requestID 是否已存在<br/>② 用户已买 + 本次 是否超限购<br/>③ 扣减库存、累加用户已买、写入 requestID 标记
-    R-->>G: 1 成功 / -1 库存不足 / -2 超限购 / -3 重复请求
+    R-->>G: 1 成功（顺带带回商品信息）<br/>-1 库存不足 / -2 超限购 / -3 重复请求<br/>-4 被限流 / -6 未开始 / -7 已结束
 
     G->>K: Publish seckill_orders（异步，不等落库）
-    G-->>U: 200 {"order": {"status": "pending"}}
+    G-->>U: 200 {"order": {"status": "queued"}}
 
     K->>W: FetchBatch 一批最多 200 条
     W->>M: BEGIN
@@ -130,7 +128,8 @@ sequenceDiagram
 
 ### 4.2 关键点：用户拿到的 `pending` 是什么意思
 
-接口返回 200 时，**订单还没有真正写进 MySQL**。用户拿到的是一张「排队凭证」：
+接口返回 200 时，**订单还没有真正写进 MySQL**。用户拿到的是一张「排队凭证」，
+接口里这个订单的 `status` 是 `queued`（排队中）；等消费端真正写进 MySQL 后，库里的状态是 `pending`：
 
 - Redis 已经扣掉了库存，说明这个名额**确实留给他了**；
 - 真正的订单由消费端稍后写入 MySQL，状态先是 `pending`；
@@ -138,14 +137,14 @@ sequenceDiagram
   所以对用户来说这个承诺是可信的。
 
 这就是典型的**「先扣减、后落库」异步下单模型**，也是秒杀能扛住高并发的原因：
-入口只做一次 Redis 调用 + 一次 Kafka 发送，不碰 MySQL 那台慢机器。
+入口只做**一次 Redis 往返** + 一次 Kafka 发送，全程不碰 MySQL 那台慢机器。
 
 ### 4.3 三层防线（面试重点）
 
 | 层次 | 位置 | 挡住什么 | 靠什么实现 |
 | --- | --- | --- | --- |
-| 第一层 | Gin 限流中间件 | 挡住刷接口的机器流量 | Redis 固定窗口计数，单 IP 100 次/秒 |
-| 第二层 | Redis Lua 脚本 | 挡住超卖、超限购、重复提交 | `checkAndPreDeductLuaScript` 一次原子完成三件事 |
+| 第一层 | 热路径 Lua 里的限流计数；管理接口另有一层 Gin 限流中间件 | 挡住刷接口的机器流量 | 抢购接口按**用户**限流（100 次/秒，和扣减共用同一次 Redis 往返）；建活动等管理接口按 IP 限流 |
+| 第二层 | Redis Lua 脚本 | 挡住超卖、超限购、重复提交、活动未开始/已结束 | `hotPathLuaScript` 一次原子完成全部校验与扣减 |
 | 第三层 | MySQL 条件更新 + 唯一索引 | 挡住前两层万一漏掉的情况 | `sold + N <= total_stock` 条件更新；`request_id`、`(item_id,user_id)` 唯一索引 |
 
 前两层是**性能手段**（把流量挡在数据库之外），第三层是**正确性底线**（哪怕前面全出错，数据库也不会超卖）。
@@ -157,26 +156,33 @@ sequenceDiagram
 | --- | --- |
 | `model.go` | `Activity`（活动）、`Item`（秒杀商品）、`Order`（秒杀订单）三个结构体 |
 | `repository.go` | 单条与批量两套数据库方法：查商品、查活动、查重、扣库存、写订单 |
-| `cache.go` | Redis 相关全部在这里：三个 Lua 脚本、cache-aside、库存对账写回 |
+| `cache.go` | Redis 相关全部在这里：热路径大脚本 `hotPathLuaScript`、回滚脚本 `rollbackLuaScript`、冷路径 `WarmUp`、库存对账写回 |
 | `queue.go` | Kafka 消息结构 `OrderMessage`、发消息、批量拉取解析、批量提交 |
 | `worker.go` | 消费端主循环 `consumeLoop`、整批落库 `processOrdersBatch`、失败补偿 `compensate` |
 | `reconcile.go` | 定时对账：拿 MySQL 的 `sold` 重新算 Redis 库存并覆盖 |
-| `service.go` | 秒杀入口 `Seckill`：校验参数 → 读缓存 → 校验活动时间 → Redis 预扣 → 发 Kafka |
+| `service.go` | 秒杀入口 `Seckill`：校验参数 → 一次 Lua 完成「限流 + 校验 + 预扣」→ 发 Kafka；缓存没准备好时回源 MySQL 填缓存后重试一次 |
 | `handler.go` / `router.go` | HTTP 层与路由注册 |
 
 ## 6. Redis Key 设计
 
 | Key 格式 | 含义 | 类型 | 有效期 | 谁写 |
 | --- | --- | --- | --- | --- |
-| `seckill:item:{itemID}:stock` | 剩余库存 | 整数 | 不过期 | Lua 预扣 / 对账覆盖 |
-| `seckill:item:{itemID}:user:{userID}` | 该用户在该商品上已买数量 | 整数 | 不过期 | Lua 预扣 / 补偿回滚 |
-| `seckill:request:{requestID}` | 幂等标记，存在即说明这个请求来过了 | 字符串 | 86400 秒 | Lua 预扣 |
-| `seckill:item:{itemID}:info` | 商品信息缓存 | JSON | 5 分钟 | cache-aside 回源后写回 |
-| `seckill:activity:{activityID}:info` | 活动信息缓存 | JSON | 5 分钟 | cache-aside 回源后写回 |
-| `ratelimit:{维度}:{窗口号}` | 限流计数 | 整数 | 一个窗口 + 2 毫秒 | 限流中间件 |
+| `seckill:item:{itemID}:stock` | 剩余库存 | 整数 | 不过期 | 热路径 Lua 预扣 / 对账覆盖 |
+| `seckill:item:{itemID}:user:{userID}` | 该用户在该商品上已买数量 | 整数 | 不过期 | 热路径 Lua 预扣 / 补偿回滚 |
+| `seckill:request:{requestID}` | 幂等标记，存在即说明这个请求来过了 | 字符串 | 86400 秒 | 热路径 Lua 预扣 |
+| `seckill:item:{itemID}:info` | 商品信息缓存（含 `total_stock`、`per_user_limit`） | JSON | 5 分钟 | 冷路径 `WarmUp` 回源后写回 |
+| `seckill:item:{itemID}:window` | 商品所属活动的时间窗，内容是 `开始时间戳:结束时间戳`（Unix 秒） | 字符串 | 5 分钟 | 冷路径 `WarmUp` 写回 |
+| `ratelimit:seckill:user:{userID}:{窗口号}` | 抢购接口的限流计数（按用户） | 整数 | 1 个窗口（1 秒） | 热路径 Lua |
+| `ratelimit:{IP}:{窗口号}` | 秒杀管理接口的限流计数（按 IP） | 整数 | 一个窗口 + 2 毫秒 | `ratelimit` 中间件 |
 
 注意 `:stock` 和 `:info` 是**两个不同的 key**，不能混用：
 前者是随时在变的整数，后者是可以放心缓存 5 分钟的 JSON。
+
+为什么活动时间要单独存一个 `:window` 字符串：热路径要在 Lua 里校验活动时间，
+而 Lua 解析 RFC3339 时间串很别扭。提前在 Go 里换算成两个整数拼起来，
+脚本切一刀就能拿到，既快又不依赖时间格式。
+`:window` 挂在**商品 ID** 而不是活动 ID 上，是因为抢购接口只拿得到商品 ID，
+而一个商品只属于一场活动，用商品 ID 一样唯一。
 
 ## 7. HTTP 接口清单
 
@@ -256,15 +262,31 @@ make kafka-lag          # 查看消费积压
 make loadtest           # 跑压测
 ```
 
+需要做性能分析（找 CPU 热点）时，用环境变量打开 pprof。
+它默认是关的，只有设了 `ENABLE_PPROF=1` 才会额外在 `127.0.0.1:6060` 上开一个
+**只绑本机**的分析端口，不影响正常压测：
+
+```bash
+ENABLE_PPROF=1 go run ./cmd/server
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'
+```
+
 详细压测数据见 `docs/benchmark.md`。
 
 ## 10. 当前瓶颈与演进方向
 
-**已经做到的**：消费端从约 80 条/秒提升到 1900+ 条/秒，Kafka 不再积压，
-`sold`、订单数、去重用户数、Redis 剩余库存四者完全一致。
+**已经做到的**：消费端从约 80 条/秒提升到 1900+ 条/秒，Kafka 不再积压；
+入口从「一次抢购 4 次 Redis 往返」合并成 **1 次**，
+单机峰值从约 5,900 QPS 提到 **约 16,000 QPS（1 万目标的 1.6 倍）**，
+512 VU 下 p50 从 84.7ms 降到 37.1ms。
+`sold`、订单数、去重用户数、去重 `request_id` 数、Redis 剩余库存五个口径完全一致。
 
-**还没做到的**：目标 1 万 QPS。目前 QPS 卡在约 1900，瓶颈**不在消费端**，
-而在 HTTP 入口这一段（Redis Lua 往返 + Kafka 发送）以及压测客户端本身。
+**下一处瓶颈已经不在代码里**：512 VU 时采的 CPU profile 显示，
+约 45% 的时间花在阻塞式 socket 系统调用（`runtime.cgocall`），
+其中约 42% 是 `net.(*conn).Write`（把 HTTP 响应写回客户端本身），
+业务代码几乎没上榜单。所以再往上走要靠部署层面：
+`GOMAXPROCS` 调参、换 Linux（epoll 比 Windows 的 I/O 路径更省）、
+HTTP 长连接、单机多实例 + 负载均衡。
 
 **如果以后要变微服务**，切分点已经天然存在：
 

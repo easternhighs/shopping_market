@@ -152,11 +152,14 @@ func (h *Handler) Seckill(c *gin.Context) {
 //   - 404 Not Found：商品或活动不存在；
 //   - 409 Conflict：和资源当前状态冲突（库存不够、已经买过、幂等键重复、活动时间不对），
 //     意思是[请求没毛病，但现在的状态不允许]，重试没有意义；
+//   - 429 Too Many Requests：请求太频繁被限流，等一会儿再来；
 //   - 500 Internal Server Error：兜底，只有真正没预料到的错误才落到这里。
 func seckillErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, ErrInvalidRequest):
 		return http.StatusBadRequest
+	case errors.Is(err, ErrRateLimited):
+		return http.StatusTooManyRequests
 	case errors.Is(err, ErrItemNotFound), errors.Is(err, ErrActivityNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrInsufficientStock),
