@@ -163,7 +163,7 @@ func (c *Cache) PreDeduct(ctx context.Context, itemID, userID uint, quantity, to
 	case -1:
 		return ErrInsufficientStock
 	case -2:
-		return errors.New("超出每人购买限制")
+		return ErrPerUserLimitExceeded
 	default:
 		return errors.New("redis lua 出现未知错误")
 	}
@@ -229,9 +229,9 @@ func (c *Cache) CheckAndPreDeduct(ctx context.Context, requestID string, itemID,
 	case -1:
 		return ErrInsufficientStock
 	case -2:
-		return errors.New("超出每人购买限制")
+		return ErrPerUserLimitExceeded
 	case -3:
-		return errors.New("重复的 request_id")
+		return ErrDuplicateRequest
 	default:
 		return errors.New("redis lua 出现未知错误")
 	}

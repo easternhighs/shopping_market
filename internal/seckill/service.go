@@ -3,6 +3,7 @@ package seckill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -22,6 +23,22 @@ var (
 	ErrAlreadySeckilled = errors.New("您已经抢购过该商品")
 	// ErrDeductUnknown 表示 Redis 扣减结果未知。
 	ErrDedectUnknown = errors.New("库存扣减未知错误")
+
+	// 下面这些是[请求被业务拒绝]的错误，它们**不是服务故障**。
+	// HTTP 层必须把它们映射成 4xx：500 的含义是[我们这边坏了]，
+	// 客户端和监控看到都会当成 bug，去重试、去告警；
+	// 而这类错误重试一万次结果也一样，应该明确告诉调用方[这次请求本身不成立]。
+	//
+	// ErrInvalidRequest 表示请求参数不合法（→ 400）。
+	ErrInvalidRequest = errors.New("请求参数不合法")
+	// ErrDuplicateRequest 表示同一个 request_id 已经处理过（→ 409）。
+	ErrDuplicateRequest = errors.New("重复的 request_id")
+	// ErrPerUserLimitExceeded 表示超过每人限购数量（→ 409）。
+	ErrPerUserLimitExceeded = errors.New("超出每人购买限制")
+	// ErrActivityNotStarted 表示秒杀活动尚未开始（→ 409）。
+	ErrActivityNotStarted = errors.New("秒杀活动尚未开始")
+	// ErrActivityEnded 表示秒杀活动已结束（→ 409）。
+	ErrActivityEnded = errors.New("秒杀活动已结束")
 )
 
 // Service 是秒杀模块的业务层。
@@ -55,10 +72,10 @@ func (s *Service) observeSeckillResult(kind string) {
 func (s *Service) CreateActivity(name string, startAt, endAt time.Time) (*Activity, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, errors.New("活动名称不能为空")
+		return nil, fmt.Errorf("%w: 活动名称不能为空", ErrInvalidRequest)
 	}
 	if !endAt.After(startAt) {
-		return nil, errors.New("结束时间必须晚于开始时间")
+		return nil, fmt.Errorf("%w: 结束时间必须晚于开始时间", ErrInvalidRequest)
 	}
 
 	a := &Activity{Name: name, StartAt: startAt, EndAt: endAt}
@@ -83,10 +100,10 @@ func (s *Service) CreateItem(activityID, skuID uint, price float64, totalStock, 
 		return nil, ErrActivityNotFound
 	}
 	if totalStock <= 0 {
-		return nil, errors.New("秒杀库存必须大于 0")
+		return nil, fmt.Errorf("%w: 秒杀库存必须大于 0", ErrInvalidRequest)
 	}
 	if perUserLimit <= 0 {
-		return nil, errors.New("每人限购数量必须大于 0")
+		return nil, fmt.Errorf("%w: 每人限购数量必须大于 0", ErrInvalidRequest)
 	}
 
 	item := &Item{
@@ -113,10 +130,10 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
-		return nil, errors.New("requestID 不能为空")
+		return nil, fmt.Errorf("%w: requestID 不能为空", ErrInvalidRequest)
 	}
 	if quantity <= 0 {
-		return nil, errors.New("抢购数量必须大于 0")
+		return nil, fmt.Errorf("%w: 抢购数量必须大于 0", ErrInvalidRequest)
 	}
 
 	//2.查询秒杀商品和活动，校验活动时间
@@ -164,16 +181,16 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 	//校验活动时间
 	now := time.Now()
 	if now.Before(activity.StartAt) {
-		return nil, errors.New("秒杀活动尚未开始")
+		return nil, ErrActivityNotStarted
 	}
 	if now.After(activity.EndAt) {
-		return nil, errors.New("秒杀活动已结束")
+		return nil, ErrActivityEnded
 	}
 
 	//3.把“requestID 防重、用户限购、库存预扣”合并到一次 Redis 原子操作。
 	// 优化目的：高并发时不再先访问两次 MySQL，减少数据库连接池压力。
 	if quantity > item.PerUserLimit {
-		return nil, errors.New("超过每人限购数量")
+		return nil, ErrPerUserLimitExceeded
 	}
 
 	if err := s.cache.CheckAndPreDeduct(ctx, requestID, itemID, userID, quantity, item.TotalStock, item.PerUserLimit); err != nil {

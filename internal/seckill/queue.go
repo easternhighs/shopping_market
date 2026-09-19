@@ -3,6 +3,7 @@ package seckill
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	kafkaclient "shopping_market/internal/pkg/kafka"
 )
@@ -33,6 +34,14 @@ type ConsumedOrder struct {
 type Queue struct {
 	producer  *kafkaclient.Producer
 	consumers []*kafkaclient.Consumer
+
+	// pending 记录已经发进 Kafka、但消费端还没提交落库的订单条数。
+	// 它回答一个很具体的问题：此刻有没有订单正在途中（Redis 已扣、MySQL 还没扣）。
+	pending atomic.Int64
+
+	// idle 记录每个消费者最近一次拉取是不是空的。
+	// 全为 true 说明每个分区都被追平过，队列里没有历史积压。
+	idle map[*kafkaclient.Consumer]*atomic.Bool
 }
 
 // NewQueue 创建秒杀 Kafka 队列。
@@ -40,7 +49,12 @@ type Queue struct {
 // 传入多个 consumer（同一个消费组）就能让多个 goroutine 并发消费；
 // 但数量不要超过 topic 的分区数，多出来的消费者会分不到分区、白白空转。
 func NewQueue(producer *kafkaclient.Producer, consumers ...*kafkaclient.Consumer) *Queue {
-	return &Queue{producer: producer, consumers: consumers}
+	idle := make(map[*kafkaclient.Consumer]*atomic.Bool, len(consumers))
+	for _, consumer := range consumers {
+		idle[consumer] = new(atomic.Bool)
+	}
+
+	return &Queue{producer: producer, consumers: consumers, idle: idle}
 }
 
 // Consumers 返回队列里的所有消费者，消费端会给每个消费者启动一个 goroutine。
@@ -60,6 +74,9 @@ func (q *Queue) Publish(ctx context.Context, message OrderMessage) error {
 		return err
 	}
 
+	// 消息确实进了 Kafka 才记账：从现在起到消费端提交为止，这条订单都算在途。
+	q.pending.Add(1)
+
 	return nil
 }
 
@@ -77,6 +94,12 @@ func (q *Queue) ConsumeBatch(ctx context.Context, consumer *kafkaclient.Consumer
 	kMsgs, err := consumer.FetchBatch(ctx, maxBatch)
 	if err != nil {
 		return nil, err
+	}
+
+	// 记下这个消费者这一轮是不是拉空了。拉空说明它负责的分区已经追平，
+	// 对账任务要等所有消费者都追平过，才敢动 Redis 里的库存。
+	if flag := q.idle[consumer]; flag != nil {
+		flag.Store(len(kMsgs) == 0)
 	}
 
 	var consumedOrders []ConsumedOrder
@@ -119,5 +142,35 @@ func (q *Queue) Commit(ctx context.Context, consumer *kafkaclient.Consumer, batc
 		return err
 	}
 
+	// 这一批（含解析失败、以及落库失败后已经回补过 Redis 的消息）都翻篇了，
+	// 在途计数减回去。
+	q.pending.Add(-int64(len(batch)))
+
 	return nil
+}
+
+// Settled 报告此刻队列是不是真的安静下来了：没有任何订单在途中，
+// 并且每个消费者都至少追平过一次。
+//
+// 为什么对账任务必须先问这一句：对账是拿 MySQL 的 sold 反推 Redis 剩余库存
+// （剩余 = 总库存 - 已售）。如果此刻还有订单在途中（Redis 已经扣了、MySQL 还没记账），
+// sold 就是偏小的，反推出来的剩余库存就是偏大的。
+// 把这个偏大的数字写回 Redis，等于凭空多出一批库存，
+// 高并发下会让本该被拒绝的请求通过，也就是超卖。
+//
+// 为什么还要看 idle：进程刚重启时 pending 是 0（这个进程还没发过消息），
+// 但 Kafka 里可能还压着上一轮没消费完的消息。只有等到每个消费者都拉空过一次，
+// 才能确认历史积压真的清完了。
+func (q *Queue) Settled() bool {
+	if q.pending.Load() != 0 {
+		return false
+	}
+
+	for _, flag := range q.idle {
+		if !flag.Load() {
+			return false
+		}
+	}
+
+	return true
 }
