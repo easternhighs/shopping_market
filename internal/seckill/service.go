@@ -139,6 +139,26 @@ func (s *Service) ListItems(activityID uint) ([]Item, error) {
 	return s.repo.ListItemsByActivityID(activityID)
 }
 
+// RemainingStock 读取某个秒杀商品在 Redis 里的剩余库存。
+//
+// 第二个返回值表示「Redis 里到底有没有这个商品的库存记录」：
+// 没有说明缓存还没热起来（第一次抢购会自动建立），不等于库存为 0。
+//
+// 和 RemainingStock 类似的只读方法都是给演示控制台、排查问题用的，
+// 不参与抢购热路径，所以可以放心走一次独立的 Redis 往返。
+func (s *Service) RemainingStock(ctx context.Context, itemID uint) (int, bool, error) {
+	return s.cache.Stock(ctx, itemID)
+}
+
+// Pending 报告此刻有多少秒杀订单「已经发进 Kafka、但还没落进 MySQL」。
+//
+// 演示控制台用它显示「Kafka 堆积」：这个数字大于 0，说明 Redis 已经扣了库存、
+// 但 MySQL 还没记账，此刻去查 MySQL 的 sold 会偏小。这也正是对账任务
+// 必须等队列安静下来才敢动 Redis 库存的原因（见 Queue.Settled）。
+func (s *Service) Pending() int64 {
+	return s.queue.Pending()
+}
+
 // rateLimitPerUser 和 rateLimitWindow 是抢购接口对单个用户的限流阈值。
 //
 // 为什么限流放在 Redis 脚本里，而不是像其他接口那样放在中间件里：
@@ -223,25 +243,54 @@ func (s *Service) Seckill(userID, itemID uint, requestID string, quantity int) (
 // warmUpCache 回源 MySQL 读出秒杀商品和它所属的活动，写进 Redis 供热路径使用。
 // 它只在热路径报告「缓存没准备好」时被调用，属于低频的冷路径。
 func (s *Service) warmUpCache(ctx context.Context, itemID uint) error {
-	item, err := s.repo.FindItemByID(itemID)
+	item, activity, err := s.loadItemAndActivity(itemID)
 	if err != nil {
 		return err
-	}
-	if item == nil {
-		return ErrItemNotFound
-	}
-
-	activity, err := s.repo.FindActivityByID(item.ActivityID)
-	if err != nil {
-		return err
-	}
-	if activity == nil {
-		return ErrActivityNotFound
 	}
 
 	// 写缓存失败不影响本次下单：这次照样往下走，下次再走一遍冷路径即可。
 	_ = s.cache.WarmUp(ctx, item, activity)
 	return nil
+}
+
+// WarmUpStock 把一个秒杀商品的缓存建好，并让 Redis 库存等于「总库存 − 已售」。
+//
+// 它和 warmUpCache 的分工：
+//   - warmUpCache 是「自愈」：抢购时发现缓存没了才回源，只补**信息**缓存，
+//     库存不碰（由 Lua 脚本在处理第一次请求时按总库存自动建出来），写失败也无所谓；
+//   - WarmUpStock 是「主动预热」：信息缓存和库存一起建好，给演示控制台造完数据后调用，
+//     这样页面上立刻就有库存数字，第一次抢购也不用走冷路径。
+func (s *Service) WarmUpStock(ctx context.Context, itemID uint) error {
+	item, activity, err := s.loadItemAndActivity(itemID)
+	if err != nil {
+		return err
+	}
+	if err := s.cache.WarmUp(ctx, item, activity); err != nil {
+		return err
+	}
+	return s.cache.SetStock(ctx, item.ID, item.TotalStock-item.Sold)
+}
+
+// loadItemAndActivity 从 MySQL 读出秒杀商品和它所属的活动。
+// 两者任意一个不存在，都会返回对应的哨兵错误。
+func (s *Service) loadItemAndActivity(itemID uint) (*Item, *Activity, error) {
+	item, err := s.repo.FindItemByID(itemID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if item == nil {
+		return nil, nil, ErrItemNotFound
+	}
+
+	activity, err := s.repo.FindActivityByID(item.ActivityID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if activity == nil {
+		return nil, nil, ErrActivityNotFound
+	}
+
+	return item, activity, nil
 }
 
 // BatchResult 是一批消息“处理完之后各自的下场”。

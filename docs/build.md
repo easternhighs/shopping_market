@@ -175,21 +175,39 @@ shopping_market/
 - **顺带产出的工具**：`cmd/server/pprof.go`——设 `ENABLE_PPROF=1` 启动才会在
   `127.0.0.1:6060` 开分析端口（默认关闭、只绑本机，不影响压测）。
 
-#### 6.2 演示控制台（让人看得见）
+#### 6.2 演示控制台（已完成）
 
 - 目标：把「后端跑得怎么样」变成一眼能看懂的画面，面试时能现场演示。
 - 定位：**不是电商前台**，只是一个演示用的控制台。商品列表、购物车、结算不做页面。
-- 任务：一个静态页面，由 Go 用 `go:embed` 挂在 `/demo` 下，原生 JS，不引入构建工具。三块：
-  - 登录区：注册 / 登录，拿到 JWT；
-  - 秒杀区：倒计时、库存进度条、抢购按钮、抢购结果；
-  - 观测区：轮询 `/metrics` 显示成功率 / 失败率 / 重复率 / 限流数，并显示 Kafka 堆积。
-  - 演示数据一键准备：预置活动、商品、库存和测试用户，避免现场手工填表。
-- 注意：
-  - 页面必须挂在独立路径，**静态资源不能被算进秒杀压测指标**；
-  - 页面上标清楚「看到的是 Redis 预扣库存，真实账本在 MySQL」——这正是讲对账的入口。
-- 完成标志：打开页面点一下就能完成一次抢购，并且能同时看到压测指标在动。
-- 风险：低。纯新增，不动后端逻辑。
-
+- 实际交付（新增 `internal/demo` 包，**只新增、没动后端业务逻辑**）：
+  - `GET /demo`：单文件页面（`internal/demo/web/index.html`，用 `go:embed` 打进二进制，原生 JS，
+    不需要 npm、不需要打包工具），深色主题，五个区块：一键准备 / 登录注册 / 独立秒杀页 / 实时观测 / 演示步骤。
+  - `GET /demo/data`：只读接口。把 MySQL 的 `total_stock`、`sold`，Redis 的 `remaining_stock`，
+    Kafka 的在途订单数 `pending` 拼成一份 JSON，页面每秒拉一次。
+  - `POST /demo/seed`：一键造数据——商品 → SKU → 库存 → 秒杀活动（`now-5min` ~ `now+2h`）→
+    秒杀商品 → 预热 Redis → 演示账号（`demo1..demoN`，密码 `demo1234`）。**幂等**：重复点不会造重复数据，
+    只有秒杀活动每次新建。用 `DEMO_SEED=0` 启动即可关掉这个接口（返回 403）。
+  - 配套改动（都是为了给演示页供数）：
+    `seckill.Cache.Stock`（读 Redis 剩余，用 `redis.Nil` 区分「没预热」和「卖光了 0 件」）、
+    `seckill.Queue.Pending`（在途订单数）、`seckill.Service.WarmUpStock`（把商品信息和库存一起预热）、
+    `product.FindSKUByProductAndSpec`（造数据时判断 SKU 是否已存在）。
+  - `internal/pkg/metrics/middleware.go` 新增 `ignoredPrefixes = ["/demo", "/metrics"]`：
+    这两个前缀**不计入 `totalRequests`**，避免演示页每秒轮询污染压测口径。
+    （秒杀成功/失败/重复/限流是业务层主动上报的，不走这里，不受影响。）
+- 指标口径（页面上已按这个口径写死文案，讲的时候别说错）：
+  `/metrics` 里的 `seckillRequests` 是**入口请求数**（每点一次抢购 +1）；
+  而 `seckillSuccess / seckillDuplicate / seckillFailure` 是**消费者落库口径**（`internal/seckill/worker.go` 上报）。
+  两者本来就会差几百毫秒到几秒，这个差值正好拿来演示「异步落库 + 在途订单」。
+- 实测验证：
+  - `gofmt -l cmd internal` 无输出；`go vet ./...` 无输出；`go build` 通过；
+  - `GET /demo` → 200 / `text/html; charset=utf-8`；`POST /demo/seed` → 建出活动、商品和 3 个账号；
+  - 抢购链路：首次 200；同 `request_id` 重放 → 409「重复的 request_id」；
+    同用户换 `request_id` 再抢 → 409「超出每人购买限制」；换账号 → 200；
+  - 一致性：造 50 件库存、抢 1 件，等 3~5 秒落库追平后 `sold=1`、Redis 剩余 `49`、`pending=0`；
+  - 口径隔离：连打 5 次 `/demo` + 5 次 `/metrics` + 2 次 `/demo/data`，`totalRequests` 只涨了 2（那 2 次是 `/health`）；
+  - `DEMO_SEED=0` 启动 → `POST /demo/seed` 返回 403，`GET /demo` 仍 200。
+- 完成标志：打开页面点一下就能完成一次抢购，并且能同时看到压测指标在动。**已达成。**
+- 风险：低。纯新增，不动后端业务逻辑。
 #### 6.3 AI 辅助可观测（可选，贴着主线做）
 
 - 目标：让系统自己发现异常，而不是靠人盯屏幕。

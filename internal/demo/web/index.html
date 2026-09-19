@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>秒杀演示控制台</title>
+<style>
+  :root {
+    --bg: #0e131a; --card: #161d27; --inner: #10161f; --line: #26313f;
+    --text: #e6edf3; --muted: #8b98a9;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #4493f8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.65 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px;
+           padding: 14px 24px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px;
+          background: #1e2733; color: var(--muted); white-space: nowrap; }
+  .pill.ok { background: rgba(63,185,80,.16); color: var(--green); }
+  .pill.bad { background: rgba(248,81,73,.16); color: var(--red); }
+  main { max-width: 1040px; margin: 0 auto; padding: 18px 24px 60px;
+         display: grid; gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line);
+          border-radius: 10px; padding: 15px 18px; }
+  .card h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+  input, select, button { font: inherit; border-radius: 6px; border: 1px solid var(--line);
+                          background: var(--inner); color: var(--text); padding: 7px 10px; }
+  input[type=number] { width: 104px; }
+  button { background: var(--blue); border-color: var(--blue); color: #fff;
+           cursor: pointer; font-weight: 500; }
+  button.ghost { background: transparent; color: var(--text); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .bar { height: 10px; border-radius: 999px; background: var(--inner);
+         overflow: hidden; margin: 8px 0 12px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--green);
+             transition: width .3s; }
+  .bar > i.low { background: var(--amber); }
+  .bar > i.empty { background: var(--red); }
+  .bar > i.idle { background: #39445a; }
+  .countdown { font-size: 15px; margin: 2px 0 0; }
+  .countdown.ok { color: var(--green); }
+  .countdown.warn { color: var(--amber); }
+  .countdown.err { color: var(--red); }
+  .stats { display: flex; flex-wrap: wrap; gap: 18px; color: var(--muted); font-size: 12.5px; }
+  .stats b { color: var(--text); font-size: 15px; margin-left: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; }
+  .cell { background: var(--inner); border: 1px solid var(--line);
+          border-radius: 8px; padding: 9px 12px; }
+  .cell span { display: block; color: var(--muted); font-size: 12px; }
+  .cell b { font-size: 18px; font-weight: 600; }
+  .out { margin: 10px 0 0; padding: 9px 12px; background: var(--inner);
+         border: 1px solid var(--line); border-radius: 8px;
+         font: 12.5px/1.75 Consolas, "Cascadia Mono", monospace;
+         max-height: 180px; overflow: auto; }
+  .out:empty { display: none; }
+  .line { white-space: pre-wrap; word-break: break-all; }
+  .line.ok { color: var(--green); }
+  .line.warn { color: var(--amber); }
+  .line.err { color: var(--red); }
+  .line.info { color: var(--muted); }
+  code { background: var(--inner); border: 1px solid var(--line);
+         border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>秒杀演示控制台</h1>
+  <span class="sub">Redis 预扣 → Kafka 排队 → MySQL 落库</span>
+  <span id="conn" class="pill">连接中…</span>
+  <span id="loginState" class="pill">未登录</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>① 一键准备演示数据</h2>
+    <p class="hint">
+      会自动准备好：商品 → SKU → 库存 → 秒杀活动 → 秒杀商品 → 演示账号，
+      并把库存预热进 Redis。反复点也安全，商品和账号会复用，只有活动是新的一场。
+    </p>
+    <div class="row">
+      <label>本次秒杀库存 <input id="seedStock" type="number" value="100" min="1" max="1000000" /></label>
+      <label>演示账号数 <input id="seedUsers" type="number" value="3" min="1" max="50" /></label>
+      <button id="seedBtn">生成演示数据</button>
+    </div>
+    <div id="seedOut" class="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>② 登录（拿 JWT）</h2>
+    <p class="hint">
+      抢购接口是需要登录的。演示账号由上面「一键准备」创建：用户名 <code>demo1</code>、<code>demo2</code>…，
+      密码统一是 <code>demo1234</code>。
+    </p>
+    <div class="row">
+      <input id="username" value="demo1" placeholder="用户名" style="width:150px" />
+      <input id="password" type="password" value="demo1234" placeholder="密码" style="width:150px" />
+      <button id="loginBtn">登录</button>
+      <button id="registerBtn" class="ghost">注册并登录</button>
+    </div>
+    <div id="loginOut" class="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>③ 独立秒杀页</h2>
+    <div class="row">
+      <select id="itemSelect" style="min-width:340px"></select>
+      <button id="seckillBtn" disabled>请先登录</button>
+    </div>
+    <p id="countdown" class="countdown">--</p>
+    <div class="bar"><i id="stockBar"></i></div>
+    <div class="stats">
+      <span>总库存<b id="stockTotal">-</b></span>
+      <span>Redis 剩余<b id="stockLeft">-</b></span>
+      <span>MySQL 已售<b id="stockSold">-</b></span>
+      <span>每人限购<b id="stockLimit">-</b></span>
+      <span>SKU<b id="stockSku">-</b></span>
+      <span>秒杀价<b id="stockPrice">-</b></span>
+    </div>
+    <p class="hint">
+      ⚠ 「Redis 剩余」才是抢购真正的闸门：能不能抢到，是 Redis 里的 Lua 脚本一锤定音的。
+      「MySQL 已售」是最终账本，比 Redis 慢一拍——两者相差多少，就是此刻还在 Kafka 里排队的订单数。
+    </p>
+    <div id="seckillOut" class="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>④ 实时观测</h2>
+    <p class="hint">
+      数字来自 <code>/metrics</code>，由服务自己上报，每秒刷新一次。用 k6 压测时，这些数字会飞起来。
+      本页面自己的轮询请求<b>不计入</b>「业务总请求」（服务端对 <code>/demo</code>、<code>/metrics</code> 做了排除），
+      所以这个数字始终只代表真实业务流量。<br />
+      注意「秒杀请求」和「落库成功」是两套口径：前者是入口收到多少次请求，后者是消费端真的往 MySQL 写成功多少单。
+      中间隔着 Kafka，所以落库口径会慢一拍——压测刚停下来时两者对不上是正常的，等几秒就追平了。
+    </p>
+    <div class="grid" id="metricsGrid"></div>
+  </section>
+
+  <section class="card">
+    <h2>⑤ 现场怎么演示</h2>
+    <p class="hint" style="margin-bottom:0">
+      1）点「一键准备」，页面立刻有库存进度条和倒计时；<br />
+      2）用 <code>demo1</code> 登录后点「立即抢购」——第一次成功，第二次会返回 409「您已经抢购过该商品」（这就是防重复购买）；<br />
+      3）换个账号 <code>demo2</code> 再抢，库存数字同步往下掉；<br />
+      4）跑压测：<code>k6 run -e MODE=seckill -e VUS=256 -e HOLD=10s -e ITEM=&lt;上面的商品 ID&gt; k6_bench.js</code>，
+      一边看「秒杀请求」往上冲、一边看 Redis 剩余掉到 0，同时「Kafka 在途订单」短暂变大后回落到 0（说明异步落库追平了）。
+    </p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+let token = "";
+let items = [];
+let current = null;
+let pending = 0;
+let serverOffset = 0;
+let renderedIds = "";
+
+/* ---------------- 小工具 ---------------- */
+function fmt(v) {
+  return (v === null || v === undefined) ? "-" : Number(v).toLocaleString();
+}
+
+function durText(ms) {
+  if (ms < 0) ms = 0;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return (h > 0 ? h + " 小时 " : "") + m + " 分 " + s + " 秒";
+}
+
+function log(boxId, text, cls) {
+  const box = $(boxId);
+  const line = document.createElement("div");
+  line.className = "line " + (cls || "info");
+  line.textContent = "[" + new Date().toLocaleTimeString() + "] " + text;
+  box.prepend(line);
+  while (box.childElementCount > 40) box.removeChild(box.lastChild);
+}
+
+function rate(part, total) {
+  if (!total) return "0%";
+  return (part / total * 100).toFixed(1) + "%";
+}
+
+function num(id) {
+  return Number($(id).value) || 0;
+}
+
+async function postJSON(url, body, useToken) {
+  const headers = { "Content-Type": "application/json" };
+  if (useToken && token) headers.Authorization = "Bearer " + token;
+
+  const res = await fetch(url, { method: "POST", headers: headers, body: JSON.stringify(body) });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* 有的响应没有 body */ }
+
+  return { status: res.status, ok: res.ok, data: data };
+}
+
+/* ---------------- 服务状态 ---------------- */
+async function checkHealth() {
+  const pill = $("conn");
+  try {
+    const res = await fetch("/health");
+    pill.textContent = res.ok ? "服务在线" : "服务异常 " + res.status;
+    pill.className = "pill " + (res.ok ? "ok" : "bad");
+  } catch (e) {
+    pill.textContent = "连不上服务";
+    pill.className = "pill bad";
+  }
+}
+
+/* ---------------- 数据与渲染 ---------------- */
+async function refreshData() {
+  try {
+    const res = await fetch("/demo/data");
+    if (!res.ok) return;
+    const data = await res.json();
+    items = data.items || [];
+    pending = data.pending || 0;
+    /* 用服务器时间校正本地时钟，免得机器时间不准导致倒计时看起来是错的 */
+    serverOffset = new Date(data.server_time).getTime() - Date.now();
+    renderItemList();
+  } catch (e) { /* 轮询失败就静默跳过，下一秒再试 */ }
+}
+
+function renderItemList() {
+  const sel = $("itemSelect");
+  const ids = items.map((it) => it.id).join(",");
+
+  /* 只有商品集合变化时才重建下拉框，否则每秒重建会把用户正在选的列表打断 */
+  if (ids !== renderedIds) {
+    const keep = sel.value;
+    sel.innerHTML = "";
+    if (items.length === 0) {
+      sel.appendChild(new Option("（还没有秒杀商品，先点上面的一键准备）", ""));
+    }
+    for (const it of items) {
+      sel.appendChild(new Option("#" + it.id + " · " + it.activity_name + " · 共 " + it.total_stock + " 件", String(it.id)));
+    }
+    renderedIds = ids;
+    if (keep) sel.value = keep;
+  }
+
+  current = items.find((it) => String(it.id) === sel.value) || items[0] || null;
+  if (current) sel.value = String(current.id);
+
+  renderItem();
+}
+
+function renderItem() {
+  const bar = $("stockBar");
+
+  if (!current) {
+    for (const id of ["stockTotal", "stockLeft", "stockSold", "stockLimit", "stockSku", "stockPrice"]) {
+      $(id).textContent = "-";
+    }
+    bar.className = "idle";
+    bar.style.width = "100%";
+    return;
+  }
+
+  const left = current.stock_ready ? current.remaining_stock : null;
+
+  $("stockTotal").textContent = fmt(current.total_stock);
+  $("stockLeft").textContent = current.stock_ready ? fmt(left) : "未预热";
+  $("stockSold").textContent = fmt(current.sold);
+  $("stockLimit").textContent = fmt(current.per_user_limit);
+  $("stockSku").textContent = "#" + current.sku_id;
+  $("stockPrice").textContent = "¥" + current.price;
+
+  if (left === null) {
+    bar.className = "idle";
+    bar.style.width = "100%";
+    return;
+  }
+
+  const pct = current.total_stock > 0 ? Math.max(0, Math.min(100, left / current.total_stock * 100)) : 0;
+  bar.style.width = pct + "%";
+  bar.className = pct <= 0 ? "empty" : (pct < 30 ? "low" : "");
+}
+
+/* 倒计时和按钮状态每 200 毫秒刷一次，所以不需要等数据轮询 */
+function tick() {
+  const cd = $("countdown");
+  const btn = $("seckillBtn");
+
+  if (!current) {
+    cd.textContent = "没有可抢购的商品";
+    cd.className = "countdown";
+    btn.disabled = true;
+    btn.textContent = "请先登录";
+    return;
+  }
+
+  const now = Date.now() + serverOffset;
+  const start = new Date(current.start_at).getTime();
+  const end = new Date(current.end_at).getTime();
+
+  if (now < start) {
+    cd.textContent = "距开始还有 " + durText(start - now);
+    cd.className = "countdown warn";
+    btn.disabled = true;
+  } else if (now > end) {
+    cd.textContent = "活动已结束";
+    cd.className = "countdown err";
+    btn.disabled = true;
+  } else {
+    cd.textContent = "抢购进行中 · 距结束 " + durText(end - now);
+    cd.className = "countdown ok";
+    btn.disabled = !token;
+  }
+
+  btn.textContent = token ? "立即抢购" : "请先登录";
+}
+
+/* ---------------- 一键准备 ---------------- */
+async function doSeed() {
+  const btn = $("seedBtn");
+  btn.disabled = true;
+  log("seedOut", "开始准备数据…", "info");
+
+  try {
+    const r = await postJSON("/demo/seed", { user_count: num("seedUsers"), total_stock: num("seedStock") });
+    if (r.ok) {
+      log("seedOut", "准备完成：秒杀商品 #" + r.data.item_id + "，总库存 " + r.data.total_stock +
+                     "，限购 " + r.data.per_user_limit + " 件/人，账号 " + r.data.users.join(" / "), "ok");
+      $("username").value = r.data.users[0];
+      $("password").value = r.data.password;
+      await refreshData();
+      tick();
+    } else {
+      log("seedOut", "准备失败：HTTP " + r.status + " " + (r.data.error || ""), "err");
+    }
+  } catch (e) {
+    log("seedOut", "准备失败：" + e, "err");
+  }
+
+  btn.disabled = false;
+}
+
+/* ---------------- 登录 ---------------- */
+async function doLogin() {
+  const username = $("username").value.trim();
+  const password = $("password").value;
+
+  try {
+    const r = await postJSON("/login", { username: username, password: password });
+    if (r.ok) {
+      token = r.data.token;
+      $("loginState").textContent = "已登录：" + username;
+      $("loginState").className = "pill ok";
+      log("loginOut", "登录成功，已拿到 JWT（令牌只放在浏览器内存里，刷新页面要重新登录）", "ok");
+      tick();
+    } else {
+      log("loginOut", "登录失败：HTTP " + r.status + " " + (r.data.error || ""), "err");
+    }
+  } catch (e) {
+    log("loginOut", "登录失败：" + e, "err");
+  }
+}
+
+async function doRegister() {
+  const username = $("username").value.trim();
+  const password = $("password").value;
+
+  try {
+    const r = await postJSON("/register", { username: username, password: password });
+    if (r.ok) {
+      log("loginOut", "注册成功，正在自动登录…", "ok");
+      await doLogin();
+    } else if (r.status === 409) {
+      log("loginOut", "用户名 " + username + " 已经存在，直接登录", "warn");
+      await doLogin();
+    } else {
+      log("loginOut", "注册失败：HTTP " + r.status + " " + (r.data.error || ""), "err");
+    }
+  } catch (e) {
+    log("loginOut", "注册失败：" + e, "err");
+  }
+}
+
+/* ---------------- 抢购 ---------------- */
+const ERR_HINT = {
+  400: "参数不合法",
+  401: "没有登录，或者令牌过期了",
+  404: "秒杀商品不存在",
+  409: "被业务规则拒绝了：库存不足 / 已经买过 / request_id 重复 / 活动时间不对",
+  429: "被限流了：同一个用户每秒最多 100 次",
+  500: "服务端出错了，去看服务日志"
+};
+
+async function doSeckill() {
+  if (!current) return;
+
+  const btn = $("seckillBtn");
+  btn.disabled = true;
+
+  /* request_id 是这次请求的“身份证”：网络抖动导致重试时，
+     服务端靠它认出“这单我已经收过了”，不会重复扣库存。 */
+  const requestId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random();
+  const t0 = performance.now();
+
+  try {
+    const r = await postJSON("/seckill/items/" + current.id + "/orders",
+                             { request_id: requestId, quantity: 1 }, true);
+    const cost = Math.round(performance.now() - t0);
+
+    if (r.ok) {
+      log("seckillOut", "抢到了！HTTP 200 · " + cost + "ms · request_id=" + requestId.slice(0, 8) +
+                        "… 已进入 Kafka 队列，稍后由消费端写进 MySQL", "ok");
+    } else {
+      log("seckillOut", "没抢到：HTTP " + r.status + " · " + cost + "ms · " + (r.data.error || "") +
+                        "（" + (ERR_HINT[r.status] || "") + "）", r.status === 429 ? "warn" : "err");
+    }
+  } catch (e) {
+    log("seckillOut", "请求失败：" + e, "err");
+  }
+
+  btn.disabled = false;
+  await refreshData();
+  tick();
+}
+
+/* ---------------- 观测 ---------------- */
+/* 两套口径要分清：
+   - 入口口径：totalRequests / seckillRequests / rateLimited，服务端一收到请求就记；
+   - 落库口径：seckillSuccess / seckillDuplicate / seckillFailure，是 Kafka 消费端
+     真正把订单写进 MySQL 之后才记的，所以会比入口口径慢一拍。
+   被限流的请求不会进 Kafka，所以「落库成功率」的分母里没有它。 */
+const METRIC_CELLS = [
+  ["totalRequests", "业务总请求"],
+  ["seckillRequests", "秒杀请求（入口）"],
+  ["seckillSuccess", "落库成功"],
+  ["seckillDuplicate", "落库重复"],
+  ["seckillFailure", "落库失败"],
+  ["rateLimited", "被限流"]
+];
+
+function cell(label, value) {
+  return '<div class="cell"><span>' + label + '</span><b>' + value + '</b></div>';
+}
+
+async function pollMetrics() {
+  try {
+    const res = await fetch("/metrics");
+    if (!res.ok) return;
+    renderMetrics(await res.json());
+  } catch (e) { /* 下一轮再试 */ }
+}
+
+function renderMetrics(m) {
+  const req = m.seckillRequests || 0;
+  const settled = (m.seckillSuccess || 0) + (m.seckillDuplicate || 0) + (m.seckillFailure || 0);
+
+  const cells = METRIC_CELLS.map((pair) => cell(pair[1], fmt(m[pair[0]])));
+
+  cells.push(cell("Kafka 在途订单", fmt(pending)));
+  cells.push(cell("落库成功率", rate(m.seckillSuccess, settled)));
+  cells.push(cell("限流占比", rate(m.rateLimited, req)));
+
+  $("metricsGrid").innerHTML = cells.join("");
+}
+
+/* ---------------- 启动 ---------------- */
+$("seedBtn").onclick = doSeed;
+$("loginBtn").onclick = doLogin;
+$("registerBtn").onclick = doRegister;
+$("seckillBtn").onclick = doSeckill;
+
+$("itemSelect").onchange = function () {
+  current = items.find((it) => String(it.id) === this.value) || null;
+  renderItem();
+  tick();
+};
+
+checkHealth();
+refreshData();
+pollMetrics();
+
+setInterval(refreshData, 1000);
+setInterval(pollMetrics, 1000);
+setInterval(tick, 200);
+setInterval(checkHealth, 5000);
+</script>
+</body>
+</html>

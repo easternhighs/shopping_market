@@ -75,3 +75,9 @@ func (s *Service) CreateSKU(productID uint, spec string, price float64) (*SKU, e
 	}
 	return sku, nil
 }
+
+// FindSKUByProductAndSpec 按「哪个商品 + 什么规格」查找一个 SKU。
+// 找不到时返回 (nil, nil)，不是错误——「没有」也是一种正常的查询结果。
+func (s *Service) FindSKUByProductAndSpec(productID uint, spec string) (*SKU, error) {
+	return s.repo.FindSKUByProductAndSpec(productID, spec)
+}

@@ -8,6 +8,7 @@ type Repository interface {
 	FindByID(id uint) (*Product, error)
 	List() ([]Product, error)
 	CreateSKU(s *SKU) error
+	FindSKUByProductAndSpec(productID uint, spec string) (*SKU, error)
 	Delete(id uint) error
 }
 
@@ -56,6 +57,22 @@ func (r *repository) List() ([]Product, error) {
 // CreateSKU 保存一个商品规格。
 func (r *repository) CreateSKU(s *SKU) error {
 	return r.db.Create(s).Error
+}
+
+// FindSKUByProductAndSpec 按「哪个商品 + 什么规格」查找一个 SKU。
+// 演示控制台造数据时用它做幂等判断：同一个商品下同名规格只建一次，
+// 这样反复点「一键准备」不会堆出一堆重复的 SKU。
+func (r *repository) FindSKUByProductAndSpec(productID uint, spec string) (*SKU, error) {
+	var sku SKU
+
+	if err := r.db.Where("product_id = ? AND spec = ?", productID, spec).First(&sku).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &sku, nil
 }
 
 // Delete 按 ID 删除商品。

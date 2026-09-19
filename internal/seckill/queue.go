@@ -149,6 +149,15 @@ func (q *Queue) Commit(ctx context.Context, consumer *kafkaclient.Consumer, batc
 	return nil
 }
 
+// Pending 报告此刻有多少订单「已经发进 Kafka、但消费端还没提交落库」。
+//
+// 它有两个用处：
+//   - 对账任务用它判断「现在能不能安全地覆盖 Redis 库存」（见 Settled）；
+//   - 演示控制台用它当作「Kafka 堆积」的近似值，实时显示有多少订单还在路上。
+func (q *Queue) Pending() int64 {
+	return q.pending.Load()
+}
+
 // Settled 报告此刻队列是不是真的安静下来了：没有任何订单在途中，
 // 并且每个消费者都至少追平过一次。
 //

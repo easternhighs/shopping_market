@@ -305,6 +305,27 @@ func (c *Cache) SetStock(ctx context.Context, itemID uint, stock int) error {
 	return c.client.Set(ctx, stockKey, stock, 0).Err()
 }
 
+// Stock 读取某个秒杀商品在 Redis 里的剩余库存。
+//
+// 第二个返回值表示「这个 key 到底存不存在」，必须跟 0 区分开：
+// 如果不区分，「缓存还没建起来」和「库存已经扣到 0」都会返回 0，
+// 演示页面上就会把「还没开始卖」显示成「已经售罄」。
+//
+// 它是给演示控制台和排查问题用的只读接口，不在抢购热路径上。
+func (c *Cache) Stock(ctx context.Context, itemID uint) (int, bool, error) {
+	stockKey := fmt.Sprintf("seckill:item:%d:stock", itemID)
+
+	value, err := c.client.Get(ctx, stockKey).Int()
+	if errors.Is(err, redis.Nil) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+
+	return value, true, nil
+}
+
 // RollbackDeduct 把一次已经预扣但最终没有落库的秒杀请求还回去。
 // 什么时候用：消费端处理 Kafka 消息失败时，MySQL 事务会回滚，但 Redis 已经扣过了；
 // 为了让两边重新对齐，需要把 Redis 库存加回来，并把用户已购买数量减回去。

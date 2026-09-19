@@ -14,6 +14,7 @@ import (
 
 	"shopping_market/internal/cart"
 	"shopping_market/internal/config"
+	"shopping_market/internal/demo"
 	"shopping_market/internal/inventory"
 	"shopping_market/internal/order"
 	"shopping_market/internal/payment"
@@ -156,6 +157,14 @@ func main() {
 	seckillGroup.Use(ratelimit.RateLimit(seckillRateLimiter, 100, time.Second, appMetrics.ObserveRateLimited))
 	seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
 
+	// 演示控制台（阶段 6.2）：把已经搭好的 user / product / inventory / seckill
+	// 四个模块串起来，挂在 /demo 下。它是纯新增的旁路功能，不参与抢购热路径；
+	// /demo 和 /metrics 的访问也不计入 metrics 的「业务总请求」，
+	// 免得演示页自己的轮询污染压测口径（见 internal/pkg/metrics/middleware.go）。
+	demoHandler := demo.NewHandler(userService, productService, inventoryService, seckillService)
+	// 「一键造数据」会往库里写数据，属于演示专用；启动时设置 DEMO_SEED=0 可以关掉它。
+	demoHandler.SetSeedEnabled(os.Getenv("DEMO_SEED") != "0")
+	demo.RegisterRoutes(r, demoHandler)
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
 	go func() {

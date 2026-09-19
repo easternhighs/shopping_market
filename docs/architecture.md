@@ -220,6 +220,17 @@ sequenceDiagram
 | GET | `/seckill/activities/:id/items` | 查看活动下的秒杀商品 |
 | POST | `/seckill/items/:item_id/orders` | **抢购（核心接口）** |
 
+**演示控制台（阶段 6.2，同样无需登录）**
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/demo` | 演示页面本体（`go:embed` 打进二进制，原生 JS，无构建工具） |
+| GET | `/demo/data` | 只读：秒杀商品 + Redis 剩余库存 + Kafka 在途订单数 |
+| POST | `/demo/seed` | 一键造演示数据（商品/SKU/库存/活动/演示账号），`DEMO_SEED=0` 时返回 403 |
+
+这三条路由挂在 `.tmp` 之外的最外层 `internal/demo` 包，只做「组装」，不碰数据库表；
+页面上点抢购走的仍然是上面那条 `/seckill/items/:item_id/orders`，照样要 JWT。
+
 ## 8. 后台任务
 
 服务启动时会额外拉起两类后台工作，它们不在请求链路上，但保证最终正确性：
@@ -244,6 +255,18 @@ flowchart LR
 
 `/metrics` 暴露的计数：`seckillRequests`、`seckillSuccess`、`seckillFailure`、
 `seckillDuplicate`、`rateLimited`。
+
+**口径提醒（讲演示页时最容易说错的地方）**：
+
+- `seckillRequests` 是**入口口径**——请求打到抢购接口就 +1，包含后面可能失败的那些；
+- `seckillSuccess / seckillDuplicate / seckillFailure` 是**落库口径**——由消费端
+  （`internal/seckill/worker.go`）在真正写 MySQL 之后才上报；
+- 所以同一时刻两者对不上是**正常的**，差值就是「还在 Kafka 里排队的订单」，
+  对应演示页上的 `pending`。等消费追平，`seckillSuccess` 会慢慢追上 `seckillRequests`。
+
+另外，`/demo` 和 `/metrics` 这两个前缀被 `internal/pkg/metrics/middleware.go`
+里的 `ignoredPrefixes` **排除在 `totalRequests` 之外**。原因是演示页每秒都在轮询，
+如果算进去会把压测口径彻底污染。
 
 ## 9. 环境与常用命令
 
