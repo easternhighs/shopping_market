@@ -39,7 +39,7 @@ var (
 	ErrActivityNotStarted = errors.New("秒杀活动尚未开始")
 	// ErrActivityEnded 表示秒杀活动已结束（→ 409）。
 	ErrActivityEnded = errors.New("秒杀活动已结束")
-	// ErrRateLimited 表示这个用户在当前时间窗口内请求太频繁（→ 429）。
+	// ErrRateLimited 表示这个用户最近一秒内请求太频繁（→ 429）。
 	ErrRateLimited = errors.New("抢购请求过于频繁")
 )
 
@@ -185,7 +185,13 @@ func (s *Service) ListUserOrders(userID uint) ([]Order, error) {
 	return s.repo.ListOrdersByUserID(userID)
 }
 
-// rateLimitPerUser 和 rateLimitWindow 是抢购接口对单个用户的限流阈值。
+// rateLimitPerUser 和 rateLimitWindow 是抢购接口对单个用户的限流阈值：
+// 任意 1 秒内最多放行 100 次。
+//
+// 注意「任意 1 秒」这四个字——这是滑动窗口，不是「每个自然秒 100 次」。
+// 固定窗口在窗口边界上会放过接近两倍的量：第 1 秒的最后 10 毫秒打 100 次、
+// 第 2 秒的头 10 毫秒再打 100 次，20 毫秒里实际过了 200 次。
+// 具体实现见 cache.go 里热路径脚本的第 1 步。
 //
 // 为什么限流放在 Redis 脚本里，而不是像其他接口那样放在中间件里：
 // 中间件的限流计数是一次独立的 Redis 往返；放进脚本后，它跟扣减共用同一次往返，

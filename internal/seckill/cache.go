@@ -58,12 +58,14 @@ return 1 -- 回补成功
 //	KEYS[3] = requestID 幂等 key
 //	KEYS[4] = 商品信息 key（JSON）
 //	KEYS[5] = 商品所属活动的时间窗 key，格式 "开始时间戳:结束时间戳"（Unix 秒）
-//	KEYS[6] = 限流计数 key（固定窗口）
+//	KEYS[6] = 限流 key（滑动窗口用的 ZSET：成员是 request_id，分数是放行时刻的毫秒时间戳）
 //	ARGV[1] = quantity       本次购买数量
 //	ARGV[2] = requestTTL     幂等 key 的过期秒数
 //	ARGV[3] = now            当前 Unix 秒（由 Go 传入，避免脚本里的时间不确定）
-//	ARGV[4] = rateLimitMax   当前窗口内最多放行多少次
-//	ARGV[5] = rateWindowSec  限流窗口的秒数，用作限流 key 的过期时间
+//	ARGV[4] = rateLimitMax   任意一个窗口长度内最多放行多少次
+//	ARGV[5] = rateWindowMs   限流窗口的毫秒数（也就是滑动窗口的长度）
+//	ARGV[6] = nowMs          当前 Unix 毫秒（滑动窗口按毫秒比较，秒精度太粗）
+//	ARGV[7] = requestID      本请求的幂等键，直接当作滑动窗口的成员
 //
 // 返回值约定（统一用「负数 = 被拒绝」表示）：
 //
@@ -79,15 +81,30 @@ return 1 -- 回补成功
 // 为什么先判活动时间再扣库存：时间校验是「这次请求到底成不成立」的前提。
 // 如果先扣再判，活动没开始的时候就会先扣掉一份库存再想办法还回去，白白多一次操作。
 const hotPathLuaScript = `
--- 1) 限流。固定窗口：同一个窗口内每来一次就 +1，超过上限直接拒绝。
+-- 1) 限流。滑动窗口：把每次「放行」的请求按毫秒时间戳记进一个 ZSET，
+--    判断依据不是「现在是第几个固定窗口」，而是「最近一个窗口长度内放行过几次」。
+--
+--    固定窗口的毛病是跨边界能过两倍的量：限制 100 次/秒时，在第 1 秒的最后 10 毫秒
+--    打 100 次、第 2 秒的头 10 毫秒再打 100 次，两次在各自的窗口里都「没超」，
+--    但现实里这 20 毫秒内实际放过了 200 次。滑动窗口按「最近 1000 毫秒」算，
+--    第二批会被直接拒掉。
+--
 --    放在最前面是有意的：被限流的请求连后面的库存都不碰，代价最小。
-local count = redis.call("INCR", KEYS[6])
-if count == 1 then
-	redis.call("EXPIRE", KEYS[6], tonumber(ARGV[5]))
-end
-if count > tonumber(ARGV[4]) then
+local nowMs = tonumber(ARGV[6])
+local windowMs = tonumber(ARGV[5])
+-- 先清掉已经滑出窗口的记录（分数 = 放行时刻的毫秒时间戳，所以下界可以是 0），
+-- 再数窗口里还剩几条：这就是「最近一个窗口内放行过多少次」。
+redis.call("ZREMRANGEBYSCORE", KEYS[6], 0, nowMs - windowMs)
+local used = redis.call("ZCARD", KEYS[6])
+if used >= tonumber(ARGV[4]) then
 	return {-4}
 end
+-- 只有放行的请求才记进窗口。如果把被拒的也记上，窗口会被自己的拒绝记录越填越满，
+-- 变成「越限封得越久」，那是另一种 bug。
+-- 成员直接用 request_id：天然唯一，而且同一个请求重放（幂等键重复）不会多占配额。
+redis.call("ZADD", KEYS[6], nowMs, ARGV[7])
+-- 兜底过期：最后一个放行时刻之后再过整整一个窗口，这个 key 就可以整条消失了。
+redis.call("PEXPIRE", KEYS[6], windowMs)
 
 -- 2) 取商品信息和活动时间窗。缺任何一个都说明缓存没准备好；
 --    这里不回源 MySQL（那会把数据库拖进高并发路径），而是让调用方走冷路径。
@@ -188,18 +205,17 @@ func (c *Cache) TrySeckill(ctx context.Context, req FastPathRequest) (*Item, err
 	itemKey := fmt.Sprintf("seckill:item:%d:info", req.ItemID)
 	windowKey := fmt.Sprintf("seckill:item:%d:window", req.ItemID)
 
-	// 限流 key 里带上窗口编号：窗口一翻页，key 就自然换成了新的，
-	// 旧 key 靠 EXPIRE 自己过期，不需要额外清理。
+	// 限流 key 不再带窗口编号：滑动窗口是「一条 key 记录最近一个窗口内所有被放行的请求」，
+	// key 靠 PEXPIRE 在最后一次放行之后自然过期，不需要按窗口翻页。
 	rateWindow := req.RateWindow
 	if rateWindow <= 0 {
 		rateWindow = time.Second
 	}
-	windowSec := int64(rateWindow / time.Second)
-	if windowSec < 1 {
-		windowSec = 1
+	rateWindowMs := rateWindow.Milliseconds()
+	if rateWindowMs < 1 {
+		rateWindowMs = 1000
 	}
-	windowID := req.Now.UnixMilli() / rateWindow.Milliseconds()
-	rateKey := fmt.Sprintf("ratelimit:seckill:user:%d:%d", req.UserID, windowID)
+	rateKey := fmt.Sprintf("ratelimit:seckill:user:%d", req.UserID)
 
 	raw, err := c.client.Eval(
 		ctx,
@@ -209,7 +225,9 @@ func (c *Cache) TrySeckill(ctx context.Context, req FastPathRequest) (*Item, err
 		requestIDTTLSeconds, // ARGV[2]
 		req.Now.Unix(),      // ARGV[3]
 		req.RateLimit,       // ARGV[4]
-		windowSec,           // ARGV[5]
+		rateWindowMs,        // ARGV[5]
+		req.Now.UnixMilli(), // ARGV[6]
+		req.RequestID,       // ARGV[7]
 	).Result()
 	if err != nil {
 		// 脚本返回 nil 或 false 时，go-redis 会返回 redis.Nil。

@@ -73,7 +73,7 @@ internal/
     kafka/       Kafka 生产者 / 消费者封装
     jwt/         JWT 签发与校验
     metrics/     自研轻量指标（对外暴露 /metrics）
-    ratelimit/   基于 Redis 的固定窗口限流
+    ratelimit/   基于 Redis 的滑动窗口限流（按 IP，给秒杀管理接口用）
 ```
 
 每个业务模块内部基本都是同一套「四件套」，看懂一个就会看懂全部：
@@ -145,7 +145,7 @@ sequenceDiagram
 
 | 层次 | 位置 | 挡住什么 | 靠什么实现 |
 | --- | --- | --- | --- |
-| 第一层 | 热路径 Lua 里的限流计数；管理接口另有一层 Gin 限流中间件 | 挡住刷接口的机器流量 | 抢购接口按**用户**限流（100 次/秒，和扣减共用同一次 Redis 往返）；建活动等管理接口按 IP 限流 |
+| 第一层 | 热路径 Lua 里的限流；管理接口另有一层 Gin 限流中间件 | 挡住刷接口的机器流量 | 抢购接口按**用户**限流（**任意** 1 秒内最多 100 次，滑动窗口，和扣减共用同一次 Redis 往返）；建活动等管理接口按 IP 限流 |
 | 第二层 | Redis Lua 脚本 | 挡住超卖、超限购、重复提交、活动未开始/已结束 | `hotPathLuaScript` 一次原子完成全部校验与扣减 |
 | 第三层 | MySQL 条件更新 + 唯一索引 | 挡住前两层万一漏掉的情况 | `sold + N <= total_stock` 条件更新；`request_id` 唯一索引（`(item_id,user_id)` 在阶段 9 改成了普通索引，原因见 4.4） |
 
@@ -251,8 +251,8 @@ flowchart TB
 | `seckill:request:{requestID}` | 幂等标记，存在即说明这个请求来过了 | 字符串 | 86400 秒 | 热路径 Lua 预扣 |
 | `seckill:item:{itemID}:info` | 商品信息缓存（含 `total_stock`、`per_user_limit`） | JSON | 5 分钟 | 冷路径 `WarmUp` 回源后写回 |
 | `seckill:item:{itemID}:window` | 商品所属活动的时间窗，内容是 `开始时间戳:结束时间戳`（Unix 秒） | 字符串 | 5 分钟 | 冷路径 `WarmUp` 写回 |
-| `ratelimit:seckill:user:{userID}:{窗口号}` | 抢购接口的限流计数（按用户） | 整数 | 1 个窗口（1 秒） | 热路径 Lua |
-| `ratelimit:{IP}:{窗口号}` | 秒杀管理接口的限流计数（按 IP） | 整数 | 一个窗口 + 2 毫秒 | `ratelimit` 中间件 |
+| `ratelimit:seckill:user:{userID}` | 抢购接口的限流**滑动窗口**（按用户）：member 是 `requestID`，score 是放行时刻的毫秒时间戳 | 有序集合 ZSET | 最后一次放行后再过 1 个窗口（1 秒） | 热路径 Lua |
+| `ratelimit:{IP}` | 秒杀管理接口的限流**滑动窗口**（按 IP）：member 是 `毫秒-进程内序号`，score 是放行时刻的毫秒时间戳 | 有序集合 ZSET | 最后一次放行后再过 1 个窗口（1 秒） | `ratelimit` 中间件 |
 | `seckill:orders:expire` | 超时关单的**延时队列**：member 是 `requestID`，score 是「到期时间戳」（Unix 秒） | 有序集合 ZSET | 不过期（处理完即 `ZREM`） | 消费端落库成功后 `ZADD`；`ExpireLoop` 处理后摘除 |
 | `seckill:order:{requestID}:restored` | 「这一单的库存已经回补过」的幂等标记 | 字符串 | 7 天 | 关单的 Redis 脚本 `SETNX` |
 
@@ -264,6 +264,17 @@ flowchart TB
 脚本切一刀就能拿到，既快又不依赖时间格式。
 `:window` 挂在**商品 ID** 而不是活动 ID 上，是因为抢购接口只拿得到商品 ID，
 而一个商品只属于一场活动，用商品 ID 一样唯一。
+
+两个限流 key 在阶段 10 从「整数计数」改成了「ZSET 记时刻」。
+老写法是 `ratelimit:seckill:user:<用户ID>:<窗口号>`，窗口号 = `当前毫秒 / 1000`，
+等于把时间切成一个个「自然秒」。这有个人尽皆知的洞：同一个用户在第 1 秒的最后 10 毫秒
+打 100 次、第 2 秒的头 10 毫秒再打 100 次，两次落在**不同的窗口**里、各自都「没超」，
+可现实里这 20 毫秒内已经放过了 200 次——上限被放大成 2 倍。
+新写法是**不数数，而是把每次放行的时刻记下来**：`ZADD <限流 key> <放行时刻毫秒> <成员>`，
+判断时先 `ZREMRANGEBYSCORE` 删掉已经滑出窗口的旧记录、再 `ZCARD` 数剩下几条，
+依据从「现在是第几个固定窗口」变成「最近 1000 毫秒内到底放行过几次」，
+没有窗口翻页，也就没有那个边界瞬间。因为窗口是滑动的，key 里不再需要窗口编号，
+整条 key 靠脚本里的 `PEXPIRE` 在「最后一次放行之后再过一整个窗口」自然消失。
 
 ## 7. HTTP 接口清单
 
