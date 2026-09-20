@@ -211,12 +211,22 @@ async function checkLanded() {
     if (!r.ok) return;
 
     const found = (r.data.orders || []).find((o) => o.request_id === myRequestID);
-    if (found) {
-      phase = "won";
-      wonOrder = found;
-      renderState();
-    }
+    if (!found) return;
+
+    wonOrder = found;
+    /* 订单落库之后可能还是待付款，也可能已经被超时任务关掉了。
+       用户一直盯着页面的时候正好超时，这里要能自动从「已抢到」翻成「已超时」，
+       否则页面会一直显示「待付款」，看起来就像后端算错了。 */
+    phase = found.status === "cancelled" ? "expired" : "won";
+    renderState();
   } catch (e) { /* 下一轮再试 */ }
+}
+
+/* 付款截止时刻（毫秒）。时限来自服务端下发的 pay_timeout_seconds，
+   不写死：演示时后端会把时限调成几十秒，写死的话倒计时会跟实际关单时间对不上。 */
+function payDeadlineMs() {
+  if (!wonOrder || !item || !item.pay_timeout_seconds) return 0;
+  return new Date(wonOrder.created_at).getTime() + item.pay_timeout_seconds * 1000;
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -292,6 +302,15 @@ function tick() {
   btn.disabled = !token || now < start || now > end || soldOut;
   btn.textContent = !token ? "请先登录" : "立即抢购";
   hint.textContent = soldOut && now <= end ? "Redis 里已经没货了，按钮点不动" : "";
+
+  /* 「已抢到、待付款」的时候顺手刷新付款倒计时。
+     放在 tick 里的原因：tick 每 200 毫秒跑一次，倒计时才会一秒一秒地走，
+     而 renderState 只在状态变化时执行一次。 */
+  const payLeft = $("payLeft");
+  if (payLeft && wonOrder) {
+    const rest = payDeadlineMs() - now;
+    payLeft.textContent = rest > 0 ? durText(rest) : "已到时间，正在关单…";
+  }
 }
 
 function renderState() {
@@ -312,8 +331,22 @@ function renderState() {
     box.innerHTML = '<div class="title">🎉 已抢到！</div>' +
       '<p class="desc">数据库里已经生成订单 <b>#' + (wonOrder ? wonOrder.id : "-") + '</b>，' +
       '状态：待付款。去 <a href="/shop#/orders">我的秒杀订单</a> 看完整的列表。<br />' +
+      '⏳ 付款倒计时：<b><span id="payLeft">-</span></b>' +
+      '——到点还没付款，后台会自动关单、把这件库存<b>还回商品池</b>。<br />' +
       '注意：这个订单号是<b>落库之后</b>才有的。抢购接口当时返回的只是「排队中」，' +
       '所以页面没有立刻拿它去查订单——那个 ID 是 0。</p>';
+    return;
+  }
+
+  if (phase === "expired") {
+    box.className = "state err";
+    box.innerHTML = '<div class="title">⌛ 超时未付款，订单已自动取消</div>' +
+      '<p class="desc">订单 <b>#' + (wonOrder ? wonOrder.id : "-") + '</b> 在 ' +
+      (item && item.pay_timeout_seconds ? item.pay_timeout_seconds : "?") + ' 秒内没有付款，' +
+      '后台的「超时关单」任务把它改成了已取消，并把这件库存<b>还回了商品池</b>。<br />' +
+      '看上面的剩余库存：数字又涨回去了——这就是「库存不会被抢到不付钱的人永久占住」。<br />' +
+      '现在可以<b>再抢一次</b>：关单之后同一个用户是可以重新下单的（<a href="/shop#/orders">我的订单</a>里' +
+      '会同时留着那条已取消和这条新的）。</p>';
     return;
   }
 
@@ -384,8 +417,13 @@ renderState();
 refresh();
 setInterval(refresh, 1000);
 setInterval(tick, 200);
-/* 排队中才去查订单，闲着的时候不打扰数据库 */
-setInterval(function () { if (phase === "queued") checkLanded(); }, 1000);
+/* 只有「排队中」和「已抢到但还没付款」这两种状态才去查订单：
+   前者在等落库结果，后者在等「会不会超时被关掉」。
+   其它时候闲着，不打扰数据库。 */
+setInterval(function () {
+  if (phase === "queued") { checkLanded(); return; }
+  if (phase === "won" && wonOrder && wonOrder.status === "pending") checkLanded();
+}, 1000);
 </script>
 </body>
 </html>

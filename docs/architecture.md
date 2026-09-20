@@ -147,10 +147,85 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | 第一层 | 热路径 Lua 里的限流计数；管理接口另有一层 Gin 限流中间件 | 挡住刷接口的机器流量 | 抢购接口按**用户**限流（100 次/秒，和扣减共用同一次 Redis 往返）；建活动等管理接口按 IP 限流 |
 | 第二层 | Redis Lua 脚本 | 挡住超卖、超限购、重复提交、活动未开始/已结束 | `hotPathLuaScript` 一次原子完成全部校验与扣减 |
-| 第三层 | MySQL 条件更新 + 唯一索引 | 挡住前两层万一漏掉的情况 | `sold + N <= total_stock` 条件更新；`request_id`、`(item_id,user_id)` 唯一索引 |
+| 第三层 | MySQL 条件更新 + 唯一索引 | 挡住前两层万一漏掉的情况 | `sold + N <= total_stock` 条件更新；`request_id` 唯一索引（`(item_id,user_id)` 在阶段 9 改成了普通索引，原因见 4.4） |
 
 前两层是**性能手段**（把流量挡在数据库之外），第三层是**正确性底线**（哪怕前面全出错，数据库也不会超卖）。
 这个「性能与正确性分离」的思路，是秒杀设计里最值得讲的一点。
+
+### 4.4 订单状态机与超时关单（阶段 9）
+
+`pending` 不是终点。一张秒杀订单的完整生命周期是：
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: 抢购接口受理（还在 Kafka 里，MySQL 无此记录）
+    queued --> pending: 消费端落库成功
+    queued --> [*]: 落库失败/重复，Redis 预扣被补偿回去
+    pending --> paid: 用户付款（本项目的占位状态，未接支付渠道）
+    pending --> cancelled: 超过付款时限，后台自动关单
+    cancelled --> [*]: 占用的库存已还回商品池
+    paid --> [*]
+```
+
+| 状态 | 含义 | `sold` 里算不算占用 | Redis 库存 |
+| --- | --- | --- | --- |
+| `queued` | 接口已受理，仅在 Kafka 中，MySQL 里查不到 | 已扣（Redis 预扣那一下） | 已扣 |
+| `pending` | 已落库，等待付款 | 算 | 已扣 |
+| `paid` | 已付款，库存真正归该用户 | 算 | 已扣 |
+| `cancelled` | 超时未付款被关单 | **不算**（关单时已减回去） | 已还回 |
+
+**为什么要有关单这件事**：订单落库后停在 `pending`、永远没有下文的话，
+「抢到不付钱」就等于**永久占住库存**——用脚本把 1000 件全抢下来一直不付款，
+商品就再也卖不出去了。这是电商里真实存在的「占库存」攻击，所以必须有超时关单。
+
+**怎么实现：延时队列 + 兜底扫描**，两条路并行：
+
+```mermaid
+flowchart TB
+    subgraph P["正常路径：Redis 延时队列"]
+        P1["订单落库成功<br/>ZADD seckill:orders:expire &lt;到期时间&gt; &lt;request_id&gt;"] --> P2["ExpireLoop 每 5 秒"]
+        P2 --> P3["ZRANGEBYSCORE -inf..now LIMIT 200<br/>捞出所有到点的 request_id"]
+        P3 --> P4["逐个 cancelExpiredOrder"]
+    end
+
+    subgraph S["安全网：MySQL 兜底扫描"]
+        S1["每 5 秒扫一次 seckill_orders"] --> S2["status='pending'<br/>AND created_at &lt; now-timeout<br/>AND created_at &gt;= now-6h"]
+        S2 --> S3["捞漏掉的订单，同样进 cancelExpiredOrder"]
+    end
+
+    P4 --> C["cancelExpiredOrder"]
+    S3 --> C
+    C --> C1["① 查订单当前状态"]
+    C1 --> C2["② UPDATE ... WHERE id=? AND status='pending'<br/>拿到关单权才继续"]
+    C2 --> C3["③ 同一个事务里 sold -= quantity"]
+    C3 --> C4["④ Redis 脚本：SETNX 回补标记 → INCRBY 库存、DECRBY 已买数"]
+    C4 --> C5["⑤ ZREM 把这条从延时队列摘掉"]
+```
+
+**关单为什么必须「先 MySQL 再 Redis」**：反过来的话，先把库存加回 Redis、
+再改 MySQL 时失败了，库存就凭空多出一份——那是**超卖**；
+正着来中途失败只是「Redis 暂时少一份库存」，属于**少卖**，
+下一轮重试或对账都能补上。一句话：**朝安全的方向失败**。
+
+**为什么幂等要做两层**：
+
+- MySQL 层：条件更新 `WHERE id=? AND status='pending'`，
+  只有 `RowsAffected = 1` 的那一次调用才算真的关单；重复调用时已经没有 `pending` 的行了。
+- Redis 层：`SETNX seckill:order:{requestID}:restored` 抢标记，只有第一个调用者真的回补。
+  光靠 MySQL 那层不够，因为「关单 → 用户重新抢购 → 再回补一次」这个场景下，
+  按「用户已买数够不够扣」是判断不出来的（详见 `expire.go` 里 `restoreOnceLuaScript` 的注释）。
+
+**`sold` 的语义在阶段 9 被明确成「还没被取消的订单占用的库存」**（含 `pending`，不含 `cancelled`）。
+这么定是因为对账任务是拿「`total_stock - sold`」反推 Redis 库存的，
+关单时如果不把 `sold` 一起减回去，下一次对账会把它按「还占着」重新算，刚还的库存又被吞掉。
+
+**`idx_user_item` 为什么从唯一索引降级成普通索引**：
+唯一索引意味着「一个用户在一个商品上只能有一行订单」。有了关单之后这会挡路——
+用户超时被关单后想重新抢，插新行会撞唯一索引失败。
+所以唯一性改由业务层判断（`status IN ('pending','paid')` 才算买过），
+真正的守门员是 Redis 里按用户计数的 key。
+注意 `AutoMigrate` 发现同名索引已存在就跳过、**不会改**，所以需要 `migrate.go`
+在启动时查一次 `information_schema` 做一次性修正。
 
 ## 5. 秒杀模块文件分工
 
@@ -162,6 +237,8 @@ sequenceDiagram
 | `queue.go` | Kafka 消息结构 `OrderMessage`、发消息、批量拉取解析、批量提交 |
 | `worker.go` | 消费端主循环 `consumeLoop`、整批落库 `processOrdersBatch`、失败补偿 `compensate` |
 | `reconcile.go` | 定时对账：拿 MySQL 的 `sold` 重新算 Redis 库存并覆盖 |
+| `expire.go` | 超时关单（阶段 9）：延时队列的读写、`ExpireLoop` 主循环、关单与库存回补 `cancelExpiredOrder` |
+| `migrate.go` | 启动时的一次性索引修正：把 `idx_user_item` 的唯一约束去掉、补建兜底扫描要用的 `(status, created_at)` 索引 |
 | `service.go` | 秒杀入口 `Seckill`：校验参数 → 一次 Lua 完成「限流 + 校验 + 预扣」→ 发 Kafka；缓存没准备好时回源 MySQL 填缓存后重试一次 |
 | `handler.go` / `router.go` | HTTP 层与路由注册 |
 
@@ -176,6 +253,8 @@ sequenceDiagram
 | `seckill:item:{itemID}:window` | 商品所属活动的时间窗，内容是 `开始时间戳:结束时间戳`（Unix 秒） | 字符串 | 5 分钟 | 冷路径 `WarmUp` 写回 |
 | `ratelimit:seckill:user:{userID}:{窗口号}` | 抢购接口的限流计数（按用户） | 整数 | 1 个窗口（1 秒） | 热路径 Lua |
 | `ratelimit:{IP}:{窗口号}` | 秒杀管理接口的限流计数（按 IP） | 整数 | 一个窗口 + 2 毫秒 | `ratelimit` 中间件 |
+| `seckill:orders:expire` | 超时关单的**延时队列**：member 是 `requestID`，score 是「到期时间戳」（Unix 秒） | 有序集合 ZSET | 不过期（处理完即 `ZREM`） | 消费端落库成功后 `ZADD`；`ExpireLoop` 处理后摘除 |
+| `seckill:order:{requestID}:restored` | 「这一单的库存已经回补过」的幂等标记 | 字符串 | 7 天 | 关单的 Redis 脚本 `SETNX` |
 
 注意 `:stock` 和 `:info` 是**两个不同的 key**，不能混用：
 前者是随时在变的整数，后者是可以放心缓存 5 分钟的 JSON。
@@ -274,6 +353,9 @@ sequenceDiagram
   而页面本来就在轮询 `/shop/data`，商品名它手上已经有了，前端查表拼一下就行。
 - **`/shop/data` 的规格查询走批量**：`ListSKUsByProductIDs` 用一条 `IN` 查询取回所有商品的规格，
   由调用方按 `product_id` 分组，避免「for 每个商品查一次」的 N+1（这个接口每秒被拉一次）。
+- **付款时限由服务端下发（`pay_timeout_seconds`，阶段 9）**：秒杀页和订单列表的倒计时都用它算，
+  前端**不写死** 15 分钟。因为后端支持用环境变量 `SECKILL_PAY_TIMEOUT` 把时限调短（演示用），
+  写死的话页面会说「还剩 15 分钟」而订单其实 30 秒后就被关掉了，看上去就像系统算错了。
 
 `/shop` 和 `/demo`、`/metrics` 一样加进了 `ignoredPrefixes`。原因不只是「数字好看」：
 页面每秒轮询，如果计入 `totalRequests`，它的耗时会被算进平均延迟，
@@ -296,10 +378,30 @@ flowchart LR
     subgraph R["对账任务（每 30 秒）"]
         R1["遍历所有秒杀商品"] --> R2["realStock = total_stock - sold"] --> R3["SET seckill:item:{id}:stock"]
     end
+
+    subgraph E["超时关单 ExpireLoop（每 5 秒）"]
+        E1["延时队列到点的那批"] --> E3["逐笔 cancelExpiredOrder"]
+        E2["兜底扫描：近 6 小时内<br/>超时未付款的订单"] --> E3
+        E3 --> E4["先 MySQL：pending→cancelled<br/>同事务 sold -= quantity"]
+        E4 --> E5["再 Redis：SETNX 标记后<br/>还库存、减已买数"]
+    end
 ```
 
 - **消费端**：负责把 Kafka 消息真正写进 MySQL；失败时把 Redis 预扣的库存还回去（补偿）。
 - **对账任务**：兜底中的兜底。万一补偿也失败，30 秒内一定会用 MySQL 的账本把 Redis 修正回来。
+- **超时关单**：把「抢到不付钱」占住的库存还回商品池（阶段 9，详见 4.4）。
+
+这三者之间有一个必须注意的交叉点：关单要分两步（先 MySQL 后 Redis），
+两步之间 MySQL 的 `sold` 已经减了、Redis 库存还没加回来，**两边正好差这一份**。
+如果对账任务正好在这一瞬间跑，它会按 MySQL 反推、把这笔账算错。
+所以关单前后会给一个原子计数器 `inFlightExpiry` 加一/减一，
+对账任务每次先看一眼，非 0 就本轮跳过（`reconcile.go`）。
+它**不是锁**，只是给对账任务的一个信号。
+
+另外，兜底扫描的查询条件是 `status = 'pending' AND created_at` 落在
+「超时点」到「6 小时前」之间，排序走 `created_at`——这三件事必须一起配合，
+才能用上 `(status, created_at)` 复合索引。少了索引，这个每 5 秒一次的小任务
+会退化成 440 万行全表扫描（实测每次 1.6~1.8 秒），扫描本身就是事故。
 
 `/metrics` 暴露的计数：`seckillRequests`、`seckillSuccess`、`seckillFailure`、
 `seckillDuplicate`、`rateLimited`。

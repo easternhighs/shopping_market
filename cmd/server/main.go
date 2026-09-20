@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -60,6 +61,13 @@ func main() {
 		&seckill.Order{},
 	); err != nil {
 		log.Fatalf("自动建表失败: %v", err)
+	}
+
+	// 超时关单依赖「同一个用户可以重新抢同一个商品」，所以得把老库上
+	// seckill_orders 的 (item_id, user_id) 唯一索引改成普通索引。
+	// 结构体 tag 改了也不会自动改老库，必须手动修正一次，原因见 migrate.go。
+	if err = seckill.EnsureOrderIndexes(dbConn); err != nil {
+		log.Fatalf("修正秒杀订单索引失败: %v", err)
 	}
 
 	// 用 gin.New() 而不是 gin.Default()，这是本项目最重要的一处性能修正。
@@ -158,6 +166,9 @@ func main() {
 	seckillService.SetMetricsObserver(appMetrics.ObserveSeckill)
 	// 抢购接口的限流在 Redis 脚本里完成，中间件看不到，所以由业务层主动上报指标。
 	seckillService.SetRateLimitObserver(appMetrics.ObserveRateLimited)
+	// 付款时限：默认 15 分钟；演示时用环境变量 SECKILL_PAY_TIMEOUT 调短（例如 20s），
+	// 不用等一刻钟就能看到「超时关单、库存还回去」。
+	seckillService.SetPayTimeout(seckillPayTimeout())
 	seckillHandler := seckill.NewHandler(seckillService)
 	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
 	// 自适应限流（6.3）：100 次/秒仍然是硬上限，但系统吃力时会自己往下收紧。
@@ -220,6 +231,10 @@ func main() {
 
 	// 启动库存对账任务：每隔一段时间，用 MySQL 的 sold 修正 Redis 库存。
 	go seckillService.ReconcileLoop(context.Background(), 30*time.Second)
+
+	// 启动秒杀超时关单任务：到点还没付款的订单会被关掉，占用的库存还回商品池。
+	// 它同时走「Redis 延时队列」和「MySQL 兜底扫描」两条路，详见 expire.go。
+	go seckillService.ExpireLoop(context.Background())
 
 	// 启动 6.3 的两个后台任务：采样循环和 LAG 探针。
 	// 它们都退出得很干脆（ctx 一取消就返回），进程退出时不会拖着不放。
@@ -292,4 +307,25 @@ func accessLog() gin.HandlerFunc {
 func healthHandler(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	c.String(http.StatusOK, `{"status":"ok"}`)
+}
+
+// seckillPayTimeout 读取环境变量 SECKILL_PAY_TIMEOUT（例如 "20s"、"15m"），
+// 得到「订单落库后多久没付款就关单」。没设置或者格式不对就用默认值。
+// 演示脚本靠它把一刻钟缩短到几十秒，这样现场就能看到超时关单的完整流程。
+func seckillPayTimeout() time.Duration {
+	const envKey = "SECKILL_PAY_TIMEOUT"
+
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return seckill.DefaultPayTimeout
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		log.Printf("%s=%q 解析失败，使用默认付款时限 %s", envKey, raw, seckill.DefaultPayTimeout)
+		return seckill.DefaultPayTimeout
+	}
+
+	log.Printf("秒杀付款时限设置为 %s（来自 %s）", d, envKey)
+	return d
 }

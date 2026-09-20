@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -49,11 +50,26 @@ type Service struct {
 	queue             *Queue
 	metricsObserver   func(kind string)
 	rateLimitObserver func()
+
+	// payTimeout 是付款时限：订单落库后多久还没付钱就自动关单、把库存还回去。
+	payTimeout time.Duration
+
+	// inFlightExpiry 记录「此刻有多少笔订单正处在关单的中途」：
+	// MySQL 里的 sold 已经减了、Redis 的库存还没加回去的那个瞬间。
+	// 对账任务看到它不为 0 就先别动 Redis 库存，避免把这笔账算重（见 ReconcileItem）。
+	// 用原子变量而不是锁：它只是给对账任务看的一个提示，读到「正在关单」跳过一轮就够了，
+	// 不需要让关单本身去等一把锁。
+	inFlightExpiry atomic.Int64
 }
 
 // NewService 创建秒杀业务层。
 func NewService(repo Repository, cache *Cache, queue *Queue) *Service {
-	return &Service{repo: repo, cache: cache, queue: queue}
+	return &Service{
+		repo:       repo,
+		cache:      cache,
+		queue:      queue,
+		payTimeout: DefaultPayTimeout,
+	}
 }
 
 // SetMetricsObserver 设置秒杀指标回调，可选。
@@ -464,6 +480,11 @@ func (s *Service) processOrdersBatch(ctx context.Context, msgs []OrderMessage) *
 		log.Print("批量落库失败，整批回补 Redis: ", err)
 		return &BatchResult{Failed: msgs}
 	}
+
+	// 落库成功 = 超时计时开始。把这一批订单的到期时间写进 Redis 延时队列，
+	// 到点后由 ExpireLoop 关单、把库存还回商品池（见 expire.go）。
+	// 这一步失败不影响成交：兜底扫描会按 created_at 把漏掉的订单捞回来。
+	s.scheduleOrderExpiry(ctx, success)
 
 	return &BatchResult{Success: success, Duplicates: duplicates}
 }

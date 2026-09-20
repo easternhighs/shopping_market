@@ -22,6 +22,15 @@ func (s *Service) ReconcileItem(ctx context.Context, itemID uint) error {
 		return nil
 	}
 
+	// 还要躲开「正在关单」的那一刻。关单是「先改 MySQL，再改 Redis」两步，
+	// 中间那一小会儿 sold 已经减了、Redis 的库存还没加回来。如果对账正好插在这中间，
+	// 它会按新的 sold 算出一个**已经包含这份库存**的剩余值写进 Redis，
+	// 紧接着关单流程再回补一次，同一份库存就被算了两遍 —— 也就是超卖。
+	// 等到关单两步都走完再对账即可，这个瞬间通常只有几毫秒。
+	if s.inFlightExpiry.Load() != 0 {
+		return nil
+	}
+
 	item, err := s.repo.FindItemByID(itemID)
 	if err != nil {
 		return err

@@ -2,6 +2,7 @@ package seckill
 
 import (
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -33,6 +34,11 @@ type Repository interface {
 	FindOrdersByUserAndItemWithTx(tx *gorm.DB, itemID uint, userIDs []uint) ([]Order, error)
 	CreateOrdersWithTx(tx *gorm.DB, orders []Order) error
 	DeductStockBatch(tx *gorm.DB, itemID uint, totalQuantity int) error
+
+	// 下面这组是「超时关单」新增的方法。
+	CancelOrderWithTx(tx *gorm.DB, orderID uint) (bool, error)
+	RestoreStockWithTx(tx *gorm.DB, itemID uint, quantity int) error
+	ListExpiredPendingOrders(before, since time.Time, limit int) ([]Order, error)
 }
 
 // repository 是接口的具体实现，用 GORM 操作 MySQL。
@@ -121,7 +127,9 @@ func (r *repository) FindOrderByRequestID(requestID string) (*Order, error) {
 // FindOrderByUserAndItem 查询某个用户是否已经抢购过某个秒杀商品。
 func (r *repository) FindOrderByUserAndItem(userID, itemID uint) (*Order, error) {
 	var o Order
-	err := r.db.Where("user_id = ? AND item_id = ?", userID, itemID).First(&o).Error
+	// 注意 status 条件：只有「还没被取消」的订单才算用户已经买过。
+	// 超时关单之后这笔订单变成 cancelled，用户就应该能重新抢一次。
+	err := r.db.Where("user_id = ? AND item_id = ? AND status IN ?", userID, itemID, activeOrderStatuses).First(&o).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -226,7 +234,9 @@ func (r *repository) FindOrdersByUserAndItemWithTx(tx *gorm.DB, itemID uint, use
 	}
 
 	var orders []Order
-	if err := tx.Where("item_id = ? AND user_id IN ?", itemID, userIDs).Find(&orders).Error; err != nil {
+	// status IN (...) 同样是为了跳过已经取消的订单：
+	// 用户超时被关单后重新抢购时，MySQL 里那笔旧订单不能把他再挡一次。
+	if err := tx.Where("item_id = ? AND user_id IN ? AND status IN ?", itemID, userIDs, activeOrderStatuses).Find(&orders).Error; err != nil {
 		return nil, err
 	}
 	return orders, nil
@@ -272,4 +282,82 @@ func (r *repository) DeductStockBatch(tx *gorm.DB, itemID uint, totalQuantity in
 	}
 
 	return nil
+}
+
+// CancelOrderWithTx 把一笔待付款订单改成「已取消」，并返回这次调用是否真的改动了它。
+//
+// 为什么用带条件的 UPDATE（`WHERE id = ? AND status = 'pending'`）而不是先查再改：
+// 关单可能被两个 goroutine 同时触发（延时队列一轮、兜底扫描一轮），
+// 而库存只能还一次。数据库的条件更新是原子的，只有一个调用者能拿到 RowsAffected = 1，
+// 另一个拿到 0 —— 「谁抢到谁负责回补库存」，天然做到了幂等。
+func (r *repository) CancelOrderWithTx(tx *gorm.DB, orderID uint) (bool, error) {
+	result := tx.Model(&Order{}).
+		Where("id = ? AND status = ?", orderID, OrderStatusPending).
+		Update("status", OrderStatusCancelled)
+
+	if result.Error != nil {
+		return false, result.Error
+	}
+
+	return result.RowsAffected == 1, nil
+}
+
+// RestoreStockWithTx 在事务里把某个秒杀商品被占用的库存还回去（sold 减回去）。
+//
+// 条件里的 sold >= quantity 是一道保险：正常调用时一定成立；
+// 万一真的出现重复关单，这条 SQL 会直接拒绝执行，把问题暴露出来，
+// 而不是把 sold 写成负数、让对账任务算出一堆莫名其妙的值。
+func (r *repository) RestoreStockWithTx(tx *gorm.DB, itemID uint, quantity int) error {
+	if quantity <= 0 {
+		return nil
+	}
+
+	result := tx.Model(&Item{}).
+		Where("id = ? AND sold >= ?", itemID, quantity).
+		Update("sold", gorm.Expr("sold - ?", quantity))
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		// RowsAffected = 0 有两种可能，必须分清楚：
+		//   - 商品行还在，但 sold 不够扣 —— 这是账目出问题了，要让它报错、被人看见；
+		//   - 商品行已经被删了 —— 没有库存可还，属于正常情况，订单照常关掉就行。
+		// 如果一律报错，一行消失的商品数据会让相关订单永远关不掉、
+		// 每几秒被重试一次，变成一颗毒丸。
+		var exists int64
+		if err := tx.Model(&Item{}).Where("id = ?", itemID).Count(&exists).Error; err != nil {
+			return err
+		}
+		if exists == 0 {
+			return ErrItemGone
+		}
+		return errors.New("回补秒杀库存失败：已售数量不足")
+	}
+
+	return nil
+}
+
+// ListExpiredPendingOrders 找出「已经超过付款时限、但还停在待付款」的订单，供兜底扫描使用。
+//
+// 为什么有了 Redis 延时队列还要扫数据库：延时队列存在 Redis 里，
+// Redis 重启、或者订单落库之后进程崩溃来不及写队列，都会让那笔订单的定时任务凭空消失。
+// MySQL 是权威账本，按 created_at 扫一遍就能把这些漏网的订单捞回来。
+//
+// 两个时间参数的含义：created_at 早于 before 才算超时；同时又不能早于 since，
+// 免得一次把**历史上所有**没付款的订单都捞出来（原因见 expireSweepLookback）。
+func (r *repository) ListExpiredPendingOrders(before, since time.Time, limit int) ([]Order, error) {
+	var orders []Order
+	// 这里按 created_at 排、而不是按 id 排，是为了能用上 (status, created_at) 复合索引：
+	// 索引进去的顺序就是 (status, created_at)，排序字段跟索引顺序一致时，
+	// MySQL 只要顺着索引取前 200 条就收工，不需要把命中的行全部捞出来再排序。
+	// 顺带的语义好处：永远先处理最早超时的那批订单，而不是随机挑一批。
+	err := r.db.Where("status = ? AND created_at < ? AND created_at >= ?", OrderStatusPending, before, since).
+		Order("created_at asc, id asc").
+		Limit(limit).
+		Find(&orders).Error
+	if err != nil {
+		return nil, err
+	}
+	return orders, nil
 }

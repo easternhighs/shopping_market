@@ -788,3 +788,59 @@ Lua 脚本在 Redis 内部是原子执行的，所以合并之后**原子性反�
 - 告警只活在本进程内存里，进程挂了就没人报；要真正的外部告警得接 Prometheus + Alertmanager；
 - `/metrics/history` 一次可能返回几百 KB（900 个样本 × 十几个指标）；
 - 瓶颈线索用写死阈值、不调用大模型——离线可复现、结论稳定是首要考虑。
+
+## 优化记录 10：超时关单的兜底扫描缺索引（阶段 9，已完成）
+
+### 起因：日志里突然满屏 SLOW SQL
+
+阶段 9 给秒杀订单加了「超时未支付就关单、库存还回去」。关单走的是 Redis 延时队列
+（`seckill:orders:expire`，一个 ZSET），但为了「万一 Redis 里没有这条记录，订单不至于永远关不掉」，
+每轮还要补一次数据库兜底扫描：
+
+```sql
+SELECT * FROM seckill_orders
+WHERE status = 'pending' AND created_at < ? AND created_at > ?
+ORDER BY id ASC LIMIT 200;
+```
+
+功能是对的，但跑起来日志里每 5 秒刷一条慢 SQL。
+
+### 量出来的原因
+
+用 `EXPLAIN` 看这条语句的执行计划：
+
+| | type | key | rows | 耗时 |
+| --- | --- | --- | --- | --- |
+| 改之前 | `index` | `PRIMARY` | 4,400,000+ | 1.6 ~ 1.8s / 次 |
+| 改之后 | `range` | `idx_status_created` | 1 | 毫秒级 |
+
+`type: index` 的意思是「顺着主键索引从头到尾读一遍」，也就是**全表扫描**。表里有 440 万条
+压测遗留的 `pending` 订单，每 5 秒扫一遍全表，1.6 秒起步。
+
+两个问题叠在一起：
+
+1. **没有能用的索引**：`status` 上没有索引，`created_at` 上也没有，优化器只能选主键全扫；
+2. **排序字段选错了**：原来写的是 `ORDER BY id ASC`，即使后来补了 `(status, created_at)` 索引，
+   按 `id` 排序也用不上它，优化器照样会去扫主键。
+
+### 这一轮改了什么
+
+- `internal/seckill/model.go`：给 `Status` 加 `index:idx_status_created,priority:1`，
+  给 `CreatedAt` 加 `index:idx_status_created,priority:2`（同一个联合索引的两列）；
+- `internal/seckill/repository.go`：`ListExpiredPendingOrders` 的排序从 `id asc` 改成
+  `created_at asc, id asc`——先按索引列排序，索引才用得上；`id` 只是为了让同一秒内到期的订单顺序稳定；
+- `internal/seckill/migrate.go`（新增）：`AutoMigrate` 会给缺索引的旧表补索引，但**不会**把已经存在的
+  同名唯一索引改成普通索引，所以启动时主动查一次 `information_schema.statistics` 来纠正（这一条是为
+  `idx_user_item` 写的，和本节的慢查询是同一轮加的）。
+
+### 实测
+
+改完重启，`EXPLAIN` 变成 `type: range`、`key: idx_status_created`、`rows: 1`；
+之后日志里除了「建索引」那一条一次性慢 SQL（33.3 秒，440 万行加索引就是这个量级），
+再没有出现过慢查询。功能回归也重跑了：超时关单、关单后可重抢、已付款不被误关三条路径都正常。
+
+### 值得记住的一句
+
+**加了新查询，先看 `EXPLAIN`，再看日志。** 这里的兜底扫描本身写得没错（有状态过滤、有时间窗、
+有 LIMIT），但「过滤条件上没有索引」会让它退化成全表扫描；而「按哪个字段排序」看似无关紧要，
+实际上直接决定了优化器能不能用上那个索引。

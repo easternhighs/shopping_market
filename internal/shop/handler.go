@@ -102,6 +102,13 @@ type seckillItemView struct {
 	// 在 JSON 里能分开：没预热时是 null，真的卖光了才是 0。
 	RemainingStock *int `json:"remaining_stock"`
 	StockReady     bool `json:"stock_ready"`
+
+	// PayTimeoutSeconds 是「抢到之后必须在多少秒内付款」，由服务端下发。
+	// 前台拿它做倒计时，用户才知道自己不是在无限期地占着库存。
+	// 为什么不让前台写死一个 15 分钟：演示时后端是用环境变量把时限调短的
+	// （见 main.go 的 seckillPayTimeout），写死的话页面会说「还剩 15 分钟」、
+	// 而订单其实 30 秒后就被关掉了，看上去就像系统算错了。
+	PayTimeoutSeconds int `json:"pay_timeout_seconds"`
 }
 
 // activityView 是前台要显示的一场活动。
@@ -243,6 +250,8 @@ func (h *Handler) Data(c *gin.Context) {
 				StartAt:      current.StartAt,
 				EndAt:        current.EndAt,
 				StockReady:   ready,
+
+				PayTimeoutSeconds: int(h.seckill.PayTimeout().Seconds()),
 			}
 			if ready {
 				view.RemainingStock = &remaining

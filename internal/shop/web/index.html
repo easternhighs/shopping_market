@@ -373,6 +373,19 @@ function renderProductDetail(id) {
 }
 
 /* ---------------- 我的秒杀订单 ---------------- */
+/* payLeftText 算出「这单还有多久被自动关单」。
+   时限来自服务端下发的 pay_timeout_seconds（见 /shop/data 的 seckill_items），
+   不写死：演示时后端会把时限调成几十秒，写死的话页面说的和后台做的就对不上了。 */
+function payLeftText(order) {
+  const it = ((catalog && catalog.seckill_items) || []).find((x) => x.id === order.item_id);
+  if (!it || !it.pay_timeout_seconds) return "";
+
+  const deadline = new Date(order.created_at).getTime() + it.pay_timeout_seconds * 1000;
+  const rest = deadline - (Date.now() + serverOffset);
+  if (rest <= 0) return " · 正在关单…";
+  return " · 还剩 " + durText(rest);
+}
+
 function renderOrders() {
   if (!token) {
     return '<div class="panel"><div class="empty">请先在右上角登录（演示账号 <code>demo1</code> / 密码 <code>demo1234</code>）。</div></div>';
@@ -380,7 +393,7 @@ function renderOrders() {
 
   const rows = myOrders.map((o) => {
     const status = o.status === "pending"
-      ? '<span class="pill warn">待付款</span>'
+      ? '<span class="pill warn">待付款' + esc(payLeftText(o)) + '</span>'
       : (o.status === "paid" ? '<span class="pill ok">已支付</span>' : '<span class="pill bad">已取消</span>');
 
     return '<tr>' +
@@ -399,6 +412,10 @@ function renderOrders() {
     '抢购接口先把它放进 Redis（预扣库存）和 Kafka（排队），接口立刻返回「排队中」；' +
     'Kafka 的消费端再慢慢把它写进 MySQL，写进去之后这页才会出现。' +
     '所以刚抢完这一页可能是空的，等一两秒刷新就出来了——这不是 bug，是异步落库的正常表现。</p>' +
+    '<p class="hint">关于「已取消」：<b>抢到不付钱，库存不能永远被占着。</b>' +
+    '每个待付款订单都带一个倒计时，到点还没付款，后台的「超时关单」任务会把它改成已取消，' +
+    '同时把这件库存<b>还回商品池</b>——你会看到剩余库存涨回去、别人也就能买了。' +
+    '被关单之后同一个用户可以重新抢，所以这里可能同时存在一条「已取消」和一条新的「待付款」。</p>' +
     '<div class="row" style="margin-bottom:10px">' +
       '<button id="refreshOrders">刷新</button>' +
       '<span class="hint" style="margin:0">每 2 秒自动刷新一次</span>' +
