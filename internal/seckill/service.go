@@ -159,6 +159,16 @@ func (s *Service) Pending() int64 {
 	return s.queue.Pending()
 }
 
+// ListUserOrders 查询某个用户名下的秒杀订单，最新的排在前面。
+//
+// 注意「抢购接口返回排队中」和「这里能查到订单」之间隔着 Kafka：
+// 刚抢完的那一瞬间这里查不到，要等消费端把订单写进 MySQL 之后才会出现。
+// 这不是 bug，而是异步落库的正常表现——前台正是靠这个「由无到有」的变化，
+// 把状态从「排队中」翻成「已抢到」。
+func (s *Service) ListUserOrders(userID uint) ([]Order, error) {
+	return s.repo.ListOrdersByUserID(userID)
+}
+
 // rateLimitPerUser 和 rateLimitWindow 是抢购接口对单个用户的限流阈值。
 //
 // 为什么限流放在 Redis 脚本里，而不是像其他接口那样放在中间件里：

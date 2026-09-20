@@ -21,6 +21,8 @@
           background: #1e2733; color: var(--muted); white-space: nowrap; }
   .pill.ok { background: rgba(63,185,80,.16); color: var(--green); }
   .pill.bad { background: rgba(248,81,73,.16); color: var(--red); }
+  /* 指向独立前台的入口。它是个 <a>，所以要显式去掉下划线、换成蓝色。 */
+  a.pill { color: var(--blue); text-decoration: none; }
   main { max-width: 1040px; margin: 0 auto; padding: 18px 24px 60px;
          display: grid; gap: 14px; }
   .card { background: var(--card); border: 1px solid var(--line);
@@ -73,6 +75,7 @@
   <span class="sub">Redis 预扣 → Kafka 排队 → MySQL 落库</span>
   <span id="conn" class="pill">连接中…</span>
   <span id="loginState" class="pill">未登录</span>
+  <a class="pill" href="/shop" target="_blank">打开前台商城 ↗</a>
 </header>
 
 <main>
@@ -157,6 +160,9 @@
   <section class="card">
     <h2>⑥ 现场怎么演示</h2>
     <p class="hint" style="margin-bottom:0">
+      0）先点右上角「打开前台商城」：那是给<b>用户</b>看的独立前台（<code>/shop</code>），
+      本页是给<b>面试官</b>看的仪表盘。两个页面看的是同一套后端，只是一个讲「用户看到了什么」，
+      一个讲「系统内部在干什么」——<b>双屏演示</b>就是这么来的（详见 <code>docs/interview.md</code>）；<br />
       1）点「一键准备」，页面立刻有库存进度条和倒计时；<br />
       2）用 <code>demo1</code> 登录后点「立即抢购」——第一次成功，第二次会返回 409「您已经抢购过该商品」（这就是防重复购买）；<br />
       3）换个账号 <code>demo2</code> 再抢，库存数字同步往下掉；<br />

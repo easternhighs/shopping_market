@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>秒购商城 · 独立前台演示</title>
+<style>
+  :root {
+    --bg: #0e131a; --card: #161d27; --inner: #10161f; --line: #26313f;
+    --text: #e6edf3; --muted: #8b98a9;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #4493f8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.65 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  a { color: var(--blue); text-decoration: none; }
+  header { display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+           padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--card); }
+  header .brand b { font-size: 17px; }
+  header .brand .sub { display: block; color: var(--muted); font-size: 12px; }
+  header nav { display: flex; gap: 6px; }
+  header nav a { padding: 5px 12px; border-radius: 999px; color: var(--muted); font-size: 13px; }
+  header nav a.on { background: #1e2733; color: var(--text); }
+  header .account { margin-left: auto; display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px 24px 60px; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 12px;
+          background: #1e2733; color: var(--muted); white-space: nowrap; }
+  .pill.ok { background: rgba(63,185,80,.16); color: var(--green); }
+  .pill.warn { background: rgba(210,153,34,.16); color: var(--amber); }
+  .pill.bad { background: rgba(248,81,73,.16); color: var(--red); }
+  input, button { font: inherit; border-radius: 6px; border: 1px solid var(--line);
+                  background: var(--inner); color: var(--text); padding: 6px 10px; }
+  button, .btn { background: var(--blue); border: 1px solid var(--blue); color: #fff;
+                 cursor: pointer; font-weight: 500; padding: 6px 12px; border-radius: 6px;
+                 display: inline-block; font-size: 13px; }
+  button.ghost, .btn.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .banner { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+            background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 12px 16px; margin-bottom: 14px; }
+  .banner .name { font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line);
+          border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .card h3 { margin: 0; font-size: 15px; }
+  .card .desc { color: var(--muted); font-size: 12.5px; margin: 0; min-height: 40px; }
+  .card .price { font-size: 20px; font-weight: 600; color: var(--amber); }
+  .card .price small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .card .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .panel { background: var(--card); border: 1px solid var(--line);
+           border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .panel h2 { margin: 0 0 6px; font-size: 15px; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 12px; }
+  .empty { color: var(--muted); padding: 26px 0; text-align: center; }
+  code { background: var(--inner); border: 1px solid var(--line);
+         border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .msg { font-size: 12.5px; margin-top: 8px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <b>🛒 秒购商城</b>
+    <span class="sub">独立前台演示 · 页面上的每个数字都来自本项目真实的接口</span>
+  </div>
+  <nav>
+    <a id="navProducts" href="#/products">全部商品</a>
+    <a id="navOrders" href="#/orders">我的秒杀订单</a>
+    <a href="/demo" target="_blank">演示控制台 ↗</a>
+  </nav>
+  <div class="account" id="account"></div>
+</header>
+
+<main>
+  <div class="banner" id="banner"><span class="pill">正在加载商品…</span></div>
+  <div id="view"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+/* 令牌放在 localStorage 里，这样从「商品列表」跳到「秒杀独立页」时不用重新登录。
+   要说清取舍：真实项目里 localStorage 的令牌有被 XSS 偷走的风险，
+   更稳妥的是 HttpOnly Cookie + CSRF 防护。这里是演示，取的是「跨页面免登录」的方便。
+   （/demo 控制台用的是内存变量，刷新就要重新登录，两种做法正好可以对照着讲。） */
+const TOKEN_KEY = "shop_token";
+const USER_KEY = "shop_user";
+
+let token = localStorage.getItem(TOKEN_KEY) || "";
+let username = localStorage.getItem(USER_KEY) || "";
+let catalog = null;      /* /shop/data 的最新结果 */
+let myOrders = [];       /* /shop/my 的最新结果 */
+let serverOffset = 0;    /* 服务器时间 - 本地时间，用来校正倒计时 */
+let ordersError = "";
+/* 商品列表默认只显示「参加秒杀的商品」：库里还有历次压测/联调留下的商品，
+   演示时全铺出来会把真正要讲的东西淹掉。想看全部随时可以切。 */
+let onlySeckill = true;
+
+/* ---------------- 小工具 ---------------- */
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmt(v) {
+  return (v === null || v === undefined) ? "-" : Number(v).toLocaleString();
+}
+
+function durText(ms) {
+  if (ms < 0) ms = 0;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return (h > 0 ? h + " 小时 " : "") + m + " 分 " + s + " 秒";
+}
+
+function timeText(iso) {
+  if (!iso) return "-";
+  return new Date(iso).toLocaleString();
+}
+
+async function api(path, options) {
+  const opts = options || {};
+  const headers = {};
+  if (opts.body) headers["Content-Type"] = "application/json";
+  if (opts.auth && token) headers.Authorization = "Bearer " + token;
+
+  const res = await fetch(path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* 有的响应没有 body */ }
+  return { status: res.status, ok: res.ok, data: data };
+}
+
+/* 找某个秒杀商品的展示数据；找不到就返回 null */
+function seckillItem(id) {
+  if (!catalog || !id) return null;
+  return (catalog.seckill_items || []).find((it) => it.id === id) || null;
+}
+
+/* 秒杀商品 -> 所属商品名（订单列表里用。
+   服务端没有帮我们拼商品名，是为了避免一条一条回查造成 N+1 次查询；
+   页面本来就在轮询 /shop/data，手上已经有这份数据了。） */
+function productNameOfItem(itemID) {
+  const it = seckillItem(itemID);
+  if (it && it.product_name) return it.product_name;
+  return "秒杀商品 #" + itemID;
+}
+
+/* ---------------- 登录区 ---------------- */
+function renderAccount() {
+  const box = $("account");
+
+  if (token) {
+    box.innerHTML = '<span class="pill ok">已登录 ' + esc(username) + '</span>' +
+                    '<button class="ghost" id="logoutBtn">退出</button>';
+    $("logoutBtn").onclick = logout;
+    return;
+  }
+
+  box.innerHTML = '<input id="accUser" value="demo1" style="width:110px" placeholder="用户名" />' +
+                  '<input id="accPass" type="password" value="demo1234" style="width:110px" placeholder="密码" />' +
+                  '<button id="loginBtn">登录</button>' +
+                  '<button class="ghost" id="registerBtn">注册并登录</button>';
+  $("loginBtn").onclick = doLogin;
+  $("registerBtn").onclick = doRegister;
+}
+
+function setToken(t, name) {
+  token = t;
+  username = name;
+  localStorage.setItem(TOKEN_KEY, t);
+  localStorage.setItem(USER_KEY, name);
+  renderAccount();
+  refreshOrders();
+}
+
+function logout() {
+  token = "";
+  username = "";
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  myOrders = [];
+  ordersError = "";
+  renderAccount();
+  render();
+}
+
+async function doLogin() {
+  const name = ($("accUser").value || "").trim();
+  const pass = $("accPass").value;
+
+  try {
+    const r = await api("/login", { method: "POST", body: { username: name, password: pass } });
+    if (r.ok) {
+      setToken(r.data.token, name);
+      render();
+    } else {
+      alert("登录失败：HTTP " + r.status + " " + (r.data.error || ""));
+    }
+  } catch (e) {
+    alert("登录失败：" + e);
+  }
+}
+
+async function doRegister() {
+  const name = ($("accUser").value || "").trim();
+  const pass = $("accPass").value;
+
+  try {
+    const r = await api("/register", { method: "POST", body: { username: name, password: pass } });
+    /* 409 表示用户名已经存在——这不是错误，直接登录就行。
+       演示账号 demo1/demo2 由 /demo 的「一键准备」创建，所以这条分支很常见。 */
+    if (r.ok || r.status === 409) {
+      await doLogin();
+      return;
+    }
+    alert("注册失败：HTTP " + r.status + " " + (r.data.error || ""));
+  } catch (e) {
+    alert("注册失败：" + e);
+  }
+}
+
+/* ---------------- 数据轮询 ---------------- */
+async function refreshCatalog() {
+  try {
+    const res = await fetch("/shop/data");
+    if (!res.ok) return;
+    catalog = await res.json();
+    serverOffset = new Date(catalog.server_time).getTime() - Date.now();
+    renderBanner();
+    render();
+  } catch (e) { /* 轮询失败就静默跳过，下一秒再试 */ }
+}
+
+async function refreshOrders() {
+  if (!token) return;
+  try {
+    const r = await api("/shop/my", { auth: true });
+    if (r.status === 401) { logout(); return; }   /* 令牌过期了，退回未登录状态 */
+    if (!r.ok) { ordersError = "HTTP " + r.status + " " + (r.data.error || ""); return; }
+    ordersError = "";
+    myOrders = r.data.orders || [];
+    if (location.hash === "#/orders") render();
+  } catch (e) {
+    ordersError = String(e);
+  }
+}
+
+/* ---------------- 顶部横幅：当前秒杀专场 ---------------- */
+function renderBanner() {
+  const box = $("banner");
+  const act = catalog && catalog.activity;
+
+  if (!act) {
+    box.innerHTML = '<span class="pill warn">当前没有秒杀活动</span>' +
+      '<span class="hint" style="margin:0">先去 <a href="/demo" target="_blank">演示控制台</a> 点一下「生成演示数据」</span>';
+    return;
+  }
+
+  const now = Date.now() + serverOffset;
+  const start = new Date(act.start_at).getTime();
+  const end = new Date(act.end_at).getTime();
+
+  let state = '<span class="pill ok">进行中 · 距结束 ' + durText(end - now) + '</span>';
+  if (now < start) state = '<span class="pill warn">未开始 · 距开始 ' + durText(start - now) + '</span>';
+  if (now > end) state = '<span class="pill bad">已结束</span>';
+
+  const items = (catalog.seckill_items || []).length;
+  box.innerHTML = '<span class="name">🔥 ' + esc(act.name) + '</span>' + state +
+                  '<span class="pill">共 ' + items + ' 款秒杀商品</span>' +
+                  '<span class="hint" style="margin:0">秒杀采用独立页面：点「立即秒杀」会跳到单独的页面去抢</span>';
+}
+
+/* ---------------- 商品列表 ---------------- */
+function renderProducts() {
+  const all = (catalog && catalog.products) || [];
+  if (all.length === 0) {
+    return '<div class="panel"><div class="empty">还没有商品。去 ' +
+           '<a href="/demo" target="_blank">演示控制台</a> 点「生成演示数据」。</div></div>';
+  }
+
+  /* 排序规则：能抢的排前面，其余按 id 倒序（新的在前）。
+     这样默认视图里就是本次秒杀专场的那几款，历史数据沉在底下。 */
+  const inSeckill = (p) => (p.skus || []).some((s) => seckillItem(s.seckill_item_id));
+  const products = all
+    .filter((p) => !onlySeckill || inSeckill(p))
+    .sort((a, b) => (inSeckill(b) ? 1 : 0) - (inSeckill(a) ? 1 : 0) || b.id - a.id);
+
+  const toolbar = '<div class="banner">' +
+    '<button id="tglSeckill" class="' + (onlySeckill ? '' : 'ghost') + '">只看秒杀商品</button>' +
+    '<button id="tglAll" class="' + (onlySeckill ? 'ghost' : '') + '">全部商品（' + all.length + '）</button>' +
+    (onlySeckill
+      ? '<span class="hint" style="margin:0">默认只列出参加本场秒杀的商品；库里其余的是历次压测留下的数据，点「全部商品」可看</span>'
+      : '<span class="hint" style="margin:0">当前显示库里全部商品，参加秒杀的那几款排在最前面</span>') +
+  '</div>';
+
+  if (products.length === 0) {
+    return toolbar + '<div class="panel"><div class="empty">当前没有参加秒杀的商品。' +
+           '去 <a href="/demo" target="_blank">演示控制台</a> 点「生成演示数据」建一场。</div></div>';
+  }
+
+  const cards = products.map((p) => {
+    /* 一个商品可能有多个规格，任意一个规格在秒杀里，这张卡就挂「立即秒杀」 */
+    const hot = (p.skus || []).map((s) => seckillItem(s.seckill_item_id)).filter(Boolean)[0] || null;
+
+    let stockLine = '<span class="pill">暂未参加秒杀</span>';
+    if (hot) {
+      const left = hot.stock_ready ? fmt(hot.remaining_stock) : "未预热";
+      stockLine = '<span class="pill ok">秒杀中 ¥' + hot.price + ' · 剩 ' + left + '/' + hot.total_stock + ' 件</span>';
+    }
+
+    return '<article class="card">' +
+      '<h3>' + esc(p.name) + '</h3>' +
+      '<p class="desc">' + esc(p.description) + '</p>' +
+      '<div class="price">¥' + p.price + ' <small>标价</small></div>' +
+      stockLine +
+      '<div class="actions">' +
+        '<a class="btn ghost" href="#/product/' + p.id + '">查看详情</a>' +
+        (hot ? '<a class="btn" href="/shop/seckill?item=' + hot.id + '">立即秒杀</a>' : '') +
+      '</div>' +
+    '</article>';
+  });
+
+  return toolbar + '<div class="grid">' + cards.join('') + '</div>' +
+    '<div class="panel"><h2>这个页面在演示什么</h2>' +
+    '<p class="hint" style="margin:0">列表上的「剩 N 件」读的是 <b>Redis</b>——它是抢购真正的闸门，' +
+    '每次刷新都在变（页面每秒自动刷新一次）。' +
+    '页面自己的刷新请求<b>不计入</b>压测口径的业务总请求，所以压测数字不会因为开着这个页面而虚高。</p></div>';
+}
+
+/* ---------------- 商品详情 ---------------- */
+function renderProductDetail(id) {
+  const p = ((catalog && catalog.products) || []).find((x) => x.id === id);
+  if (!p) return '<div class="panel"><div class="empty">商品不存在。</div></div>';
+
+  const rows = (p.skus || []).map((s) => {
+    const hot = seckillItem(s.seckill_item_id);
+    let state = '<span class="pill">普通在售</span>';
+    let action = '<span class="hint" style="margin:0">秒杀只对参加活动的规格开放</span>';
+
+    if (hot) {
+      const left = hot.stock_ready ? fmt(hot.remaining_stock) : "未预热";
+      state = '<span class="pill ok">秒杀中 · 剩 ' + left + '/' + hot.total_stock + ' 件</span>';
+      action = '<a class="btn" href="/shop/seckill?item=' + hot.id + '">立即秒杀 ¥' + hot.price + '</a>';
+    }
+
+    return '<tr><td>' + esc(s.spec) + '</td><td>¥' + s.price + '</td><td>' + state + '</td><td>' + action + '</td></tr>';
+  }).join('');
+
+  return '<div class="panel">' +
+    '<p class="hint" style="margin:0 0 10px"><a href="#/products">← 返回商品列表</a></p>' +
+    '<h2>' + esc(p.name) + '</h2>' +
+    '<p class="hint">' + esc(p.description) + '</p>' +
+    '<table><tr><th>规格</th><th>价格</th><th>状态</th><th>操作</th></tr>' +
+    (rows || '<tr><td colspan="4">这个商品还没有规格</td></tr>') +
+    '</table></div>' +
+    '<div class="panel"><h2>为什么秒杀要单独开一个页面</h2>' +
+    '<p class="hint" style="margin:0">商品详情是「读多写少」的页面，秒杀页在开抢那一秒要扛住上万次点击，' +
+    '两者的压力根本不是一个量级。真实电商会把秒杀页独立部署、独立扩容，' +
+    '本项目用独立 URL <code>/shop/seckill?item=N</code> 把这个划分体现出来。</p></div>';
+}
+
+/* ---------------- 我的秒杀订单 ---------------- */
+function renderOrders() {
+  if (!token) {
+    return '<div class="panel"><div class="empty">请先在右上角登录（演示账号 <code>demo1</code> / 密码 <code>demo1234</code>）。</div></div>';
+  }
+
+  const rows = myOrders.map((o) => {
+    const status = o.status === "pending"
+      ? '<span class="pill warn">待付款</span>'
+      : (o.status === "paid" ? '<span class="pill ok">已支付</span>' : '<span class="pill bad">已取消</span>');
+
+    return '<tr>' +
+      '<td>#' + o.id + '</td>' +
+      '<td>' + esc(productNameOfItem(o.item_id)) + '</td>' +
+      '<td>' + o.quantity + '</td>' +
+      '<td>' + status + '</td>' +
+      '<td>' + esc(timeText(o.created_at)) + '</td>' +
+      '<td><code>' + esc(String(o.request_id).slice(0, 8)) + '…</code></td>' +
+    '</tr>';
+  }).join('');
+
+  return '<div class="panel">' +
+    '<h2>我的秒杀订单</h2>' +
+    '<p class="hint">这一页回答一个问题：<b>点完「立即抢购」之后，那一单到底去哪了。</b>' +
+    '抢购接口先把它放进 Redis（预扣库存）和 Kafka（排队），接口立刻返回「排队中」；' +
+    'Kafka 的消费端再慢慢把它写进 MySQL，写进去之后这页才会出现。' +
+    '所以刚抢完这一页可能是空的，等一两秒刷新就出来了——这不是 bug，是异步落库的正常表现。</p>' +
+    '<div class="row" style="margin-bottom:10px">' +
+      '<button id="refreshOrders">刷新</button>' +
+      '<span class="hint" style="margin:0">每 2 秒自动刷新一次</span>' +
+    '</div>' +
+    (ordersError ? '<p class="msg err">查询失败：' + esc(ordersError) + '</p>' : '') +
+    '<table><tr><th>订单号</th><th>商品</th><th>数量</th><th>状态</th><th>下单时间</th><th>请求号</th></tr>' +
+    (rows || '<tr><td colspan="6" class="empty">还没有秒杀订单。回商品列表点一次「立即秒杀」试试。</td></tr>') +
+    '</table></div>';
+}
+
+/* ---------------- 路由与渲染 ---------------- */
+function render() {
+  const hash = location.hash || "#/products";
+
+  $("navProducts").className = hash.indexOf("#/orders") === 0 ? "" : "on";
+  $("navOrders").className = hash.indexOf("#/orders") === 0 ? "on" : "";
+
+  if (hash.indexOf("#/product/") === 0) {
+    $("view").innerHTML = renderProductDetail(Number(hash.replace("#/product/", "")));
+  } else if (hash.indexOf("#/orders") === 0) {
+    $("view").innerHTML = renderOrders();
+    const btn = $("refreshOrders");
+    if (btn) btn.onclick = refreshOrders;
+  } else {
+    $("view").innerHTML = renderProducts();
+    const btnHot = $("tglSeckill"), btnAll = $("tglAll");
+    if (btnHot) btnHot.onclick = function () { onlySeckill = true; render(); };
+    if (btnAll) btnAll.onclick = function () { onlySeckill = false; render(); };
+  }
+}
+
+window.addEventListener("hashchange", render);
+
+renderAccount();
+render();
+refreshCatalog();
+refreshOrders();
+setInterval(refreshCatalog, 1000);
+setInterval(function () { if (location.hash === "#/orders") refreshOrders(); }, 2000);
+</script>
+</body>
+</html>

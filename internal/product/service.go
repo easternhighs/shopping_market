@@ -81,3 +81,9 @@ func (s *Service) CreateSKU(productID uint, spec string, price float64) (*SKU, e
 func (s *Service) FindSKUByProductAndSpec(productID uint, spec string) (*SKU, error) {
 	return s.repo.FindSKUByProductAndSpec(productID, spec)
 }
+
+// ListSKUsByProductIDs 一次列出多个商品的全部规格。
+// 前台列表页要同时展示十几个商品，用批量查询代替「一个商品查一次」。
+func (s *Service) ListSKUsByProductIDs(productIDs []uint) ([]SKU, error) {
+	return s.repo.ListSKUsByProductIDs(productIDs)
+}

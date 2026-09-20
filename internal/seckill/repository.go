@@ -18,6 +18,9 @@ type Repository interface {
 	FindOrderByRequestID(requestID string) (*Order, error)
 	FindOrderByUserAndItem(userID, itemID uint) (*Order, error)
 	CreateOrder(o *Order) error
+	// ListOrdersByUserID 查询某个用户名下的全部秒杀订单，最新的排在前面。
+	// 前台「我的秒杀订单」靠它把「刚才排队的那一单」查回来。
+	ListOrdersByUserID(userID uint) ([]Order, error)
 	FindOrderByRequestIDWithTx(tx *gorm.DB, requestID string) (*Order, error)
 	FindOrderByUserAndItemWithTx(tx *gorm.DB, userID, itemID uint) (*Order, error)
 	CreateOrderWithTx(tx *gorm.DB, o *Order) error
@@ -131,6 +134,18 @@ func (r *repository) FindOrderByUserAndItem(userID, itemID uint) (*Order, error)
 // CreateOrder 创建秒杀订单。
 func (r *repository) CreateOrder(o *Order) error {
 	return r.db.Create(o).Error
+}
+
+// ListOrdersByUserID 查询某个用户名下的全部秒杀订单，最新的排在前面。
+//
+// 为什么要按 id 倒序：前台「我的秒杀订单」关心的是「我刚点的那一单落库了没有」，
+// 新的排在前面，用户一眼就能看到，不用翻到列表底部。
+func (r *repository) ListOrdersByUserID(userID uint) ([]Order, error) {
+	var orders []Order
+	if err := r.db.Where("user_id = ?", userID).Order("id desc").Find(&orders).Error; err != nil {
+		return nil, err
+	}
+	return orders, nil
 }
 
 // FindOrderByRequestIDWithTx 在事务里按幂等键查询秒杀订单。

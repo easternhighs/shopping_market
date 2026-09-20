@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>限时秒杀 · 秒购商城</title>
+<style>
+  :root {
+    --bg: #0e131a; --card: #161d27; --inner: #10161f; --line: #26313f;
+    --text: #e6edf3; --muted: #8b98a9;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #4493f8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.65 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  a { color: var(--blue); text-decoration: none; }
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+           padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--card); }
+  header .brand b { font-size: 16px; }
+  header .account { margin-left: auto; display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  main { max-width: 720px; margin: 0 auto; padding: 20px 24px 60px; }
+  .panel { background: var(--card); border: 1px solid var(--line);
+           border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px;
+         background: rgba(248,81,73,.16); color: var(--red); }
+  h1 { font-size: 21px; margin: 10px 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .price { font-size: 34px; font-weight: 700; color: var(--amber); line-height: 1.2; }
+  .price small { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .countdown { font-size: 16px; margin: 6px 0 14px; }
+  .countdown.ok { color: var(--green); }
+  .countdown.warn { color: var(--amber); }
+  .countdown.err { color: var(--red); }
+  .bar { height: 12px; border-radius: 999px; background: var(--inner); overflow: hidden; margin: 6px 0 8px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--green); transition: width .3s; }
+  .bar > i.low { background: var(--amber); }
+  .bar > i.empty { background: var(--red); }
+  .bar > i.idle { background: #39445a; }
+  .stats { display: flex; flex-wrap: wrap; gap: 16px; color: var(--muted); font-size: 12.5px; }
+  .stats b { color: var(--text); }
+  button, .btn { font: inherit; border-radius: 8px; border: 1px solid var(--blue);
+                 background: var(--blue); color: #fff; cursor: pointer;
+                 font-weight: 600; padding: 12px 26px; font-size: 15px; }
+  button.ghost { background: transparent; color: var(--text); border-color: var(--line);
+                 font-weight: 500; padding: 6px 12px; font-size: 13px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input { font: inherit; border-radius: 6px; border: 1px solid var(--line);
+          background: var(--inner); color: var(--text); padding: 6px 10px; }
+  .state { border-radius: 10px; padding: 14px 16px; background: var(--inner);
+           border: 1px solid var(--line); margin-top: 14px; }
+  .state .title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .state .desc { color: var(--muted); font-size: 12.5px; margin: 0; }
+  .state.ok { border-color: rgba(63,185,80,.5); }
+  .state.ok .title { color: var(--green); }
+  .state.warn { border-color: rgba(210,153,34,.5); }
+  .state.warn .title { color: var(--amber); }
+  .state.err { border-color: rgba(248,81,73,.5); }
+  .state.err .title { color: var(--red); }
+  .hint { color: var(--muted); font-size: 12.5px; }
+  code { background: var(--inner); border: 1px solid var(--line);
+         border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .steps { color: var(--muted); font-size: 12.5px; line-height: 1.9; margin: 0; padding-left: 18px; }
+  .steps b { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><a href="/shop">← 返回商城</a> &nbsp; <b>⚡ 限时秒杀</b></div>
+  <div class="account" id="account"></div>
+</header>
+
+<main>
+  <div class="panel" id="itemPanel"><span class="hint">正在加载秒杀商品…</span></div>
+
+  <div class="panel">
+    <button id="seckillBtn" disabled>请先登录</button>
+    <span class="hint" id="btnHint" style="margin-left:10px"></span>
+    <div class="state" id="state">
+      <div class="title">还没开始抢</div>
+      <p class="desc">点上面的按钮试试。抢购请求会先经过 Redis 判断「还有没有库存」，再排队进 Kafka。</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="font-size:15px;margin:0 0 8px">这一单背后发生了什么</h2>
+    <ol class="steps">
+      <li><b>你点了按钮</b> → 请求打到 <code>/seckill/items/&lt;id&gt;/orders</code>。</li>
+      <li><b>Redis 一锤定音</b>：库存够不够、你是不是已经买过、是不是重复提交、是不是点太快——
+          全在一段 Lua 脚本里一次算完，只花一次网络往返。</li>
+      <li><b>接口立刻回你「排队中」</b>：这时候数据库里<b>还没有</b>这张订单，只有 Redis 扣了库存。</li>
+      <li><b>Kafka 排队 → 消费端落库</b>：后台的消费端把订单批量写进 MySQL，写完之后「我的秒杀订单」里才会出现它。</li>
+      <li><b>所以你看到的顺序是</b>：排队中 → 已抢到（订单号出现）。中间那几百毫秒，就是这套异步架构的代价，
+          换来的是一万次点击不会把数据库打死。</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const TOKEN_KEY = "shop_token";
+const USER_KEY = "shop_user";
+
+/* 令牌和列表页共用同一份，这样从商品列表跳过来不用重新登录 */
+let token = localStorage.getItem(TOKEN_KEY) || "";
+let username = localStorage.getItem(USER_KEY) || "";
+
+const params = new URLSearchParams(location.search);
+const itemID = Number(params.get("item") || 0);
+
+let item = null;          /* 当前秒杀商品的展示数据 */
+let serverOffset = 0;
+let phase = "idle";       /* idle | queued | won | rejected */
+let myRequestID = "";
+let wonOrder = null;
+let reason = "";
+let queuedAt = 0;
+
+/* ---------------- 小工具 ---------------- */
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmt(v) { return (v === null || v === undefined) ? "-" : Number(v).toLocaleString(); }
+
+function durText(ms) {
+  if (ms < 0) ms = 0;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return (h > 0 ? h + " 小时 " : "") + m + " 分 " + s + " 秒";
+}
+
+async function api(path, options) {
+  const opts = options || {};
+  const headers = {};
+  if (opts.body) headers["Content-Type"] = "application/json";
+  if (opts.auth && token) headers.Authorization = "Bearer " + token;
+
+  const res = await fetch(path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* 有的响应没有 body */ }
+  return { status: res.status, ok: res.ok, data: data };
+}
+
+/* ---------------- 登录区 ---------------- */
+function renderAccount() {
+  const box = $("account");
+
+  if (token) {
+    box.innerHTML = '<span class="hint" style="margin:0">已登录 ' + esc(username) + '</span>' +
+                    '<button class="ghost" id="logoutBtn">退出</button>';
+    $("logoutBtn").onclick = function () {
+      token = ""; username = "";
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(USER_KEY);
+      renderAccount();
+      renderItem();
+    };
+    return;
+  }
+
+  box.innerHTML = '<input id="accUser" value="demo1" style="width:100px" placeholder="用户名" />' +
+                  '<input id="accPass" type="password" value="demo1234" style="width:100px" placeholder="密码" />' +
+                  '<button class="ghost" id="loginBtn">登录</button>';
+  $("loginBtn").onclick = doLogin;
+}
+
+async function doLogin() {
+  const name = ($("accUser").value || "").trim();
+  const pass = $("accPass").value;
+
+  const r = await api("/login", { method: "POST", body: { username: name, password: pass } });
+  if (!r.ok) { alert("登录失败：HTTP " + r.status + " " + (r.data.error || "")); return; }
+
+  token = r.data.token;
+  username = name;
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(USER_KEY, username);
+  renderAccount();
+  renderItem();
+}
+
+/* ---------------- 数据 ---------------- */
+async function refresh() {
+  try {
+    const res = await fetch("/shop/data");
+    if (!res.ok) return;
+    const data = await res.json();
+    serverOffset = new Date(data.server_time).getTime() - Date.now();
+    item = (data.seckill_items || []).find((it) => it.id === itemID) || null;
+    renderItem();
+    tick();
+  } catch (e) { /* 轮询失败就静默跳过 */ }
+}
+
+/* 找到了「我这次抢购」对应的订单：说明 Kafka 消费端已经把它写进 MySQL 了 */
+async function checkLanded() {
+  if (!token || !myRequestID) return;
+
+  try {
+    const r = await api("/shop/my", { auth: true });
+    if (!r.ok) return;
+
+    const found = (r.data.orders || []).find((o) => o.request_id === myRequestID);
+    if (found) {
+      phase = "won";
+      wonOrder = found;
+      renderState();
+    }
+  } catch (e) { /* 下一轮再试 */ }
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderItem() {
+  const box = $("itemPanel");
+
+  if (!itemID) {
+    box.innerHTML = '<span class="hint">地址里没有指定秒杀商品。回 <a href="/shop">商品列表</a> 挑一个吧。</span>';
+    return;
+  }
+  if (!item) {
+    box.innerHTML = '<span class="hint">没找到这个秒杀商品（可能活动已经过期、或者数据还没准备）。' +
+                    '回 <a href="/shop">商品列表</a> 看看。</span>';
+    return;
+  }
+
+  const left = item.stock_ready ? item.remaining_stock : null;
+  let pct = 100, cls = "idle";
+  if (left !== null) {
+    pct = item.total_stock > 0 ? Math.max(0, Math.min(100, left / item.total_stock * 100)) : 0;
+    cls = pct <= 0 ? "empty" : (pct < 30 ? "low" : "");
+  }
+
+  box.innerHTML =
+    '<span class="tag">限时秒杀</span>' +
+    '<h1>' + esc(item.product_name || ("秒杀商品 #" + item.id)) + '</h1>' +
+    '<p class="sub">' + esc(item.activity_name) + ' · 规格 SKU #' + item.sku_id + '</p>' +
+    '<div class="price">¥' + item.price + ' <small>秒杀价</small></div>' +
+    '<p id="countdown" class="countdown">--</p>' +
+    '<div class="bar"><i id="stockBar" class="' + cls + '" style="width:' + pct + '%"></i></div>' +
+    '<div class="stats">' +
+      '<span>总库存 <b>' + fmt(item.total_stock) + '</b></span>' +
+      '<span>Redis 剩余 <b>' + (item.stock_ready ? fmt(left) : "未预热") + '</b></span>' +
+      '<span>已售（MySQL） <b>' + fmt(item.sold) + '</b></span>' +
+      '<span>每人限购 <b>' + fmt(item.per_user_limit) + '</b></span>' +
+    '</div>';
+}
+
+/* 倒计时和按钮状态每 200 毫秒刷一次，不必等数据轮询 */
+function tick() {
+  const cd = $("countdown");
+  const btn = $("seckillBtn");
+  const hint = $("btnHint");
+  if (!cd || !btn) return;
+
+  if (!item) { btn.disabled = true; cd.textContent = "--"; return; }
+
+  const now = Date.now() + serverOffset;
+  const start = new Date(item.start_at).getTime();
+  const end = new Date(item.end_at).getTime();
+  const left = item.stock_ready ? item.remaining_stock : null;
+
+  if (now < start) {
+    cd.textContent = "距开始还有 " + durText(start - now);
+    cd.className = "countdown warn";
+  } else if (now > end) {
+    cd.textContent = "活动已结束（" + new Date(item.end_at).toLocaleString() + " 结束）";
+    cd.className = "countdown err";
+  } else {
+    cd.textContent = "抢购进行中 · 距结束 " + durText(end - now);
+    cd.className = "countdown ok";
+  }
+
+  /* 排队中不许重复点：点了也是一次新的 request_id，白白多打一次后端 */
+  if (phase === "queued") {
+    btn.disabled = true;
+    btn.textContent = "排队中…";
+    hint.textContent = "正在等 Kafka 消费端把订单写进数据库";
+    return;
+  }
+
+  const soldOut = left !== null && left <= 0;
+  btn.disabled = !token || now < start || now > end || soldOut;
+  btn.textContent = !token ? "请先登录" : "立即抢购";
+  hint.textContent = soldOut && now <= end ? "Redis 里已经没货了，按钮点不动" : "";
+}
+
+function renderState() {
+  const box = $("state");
+
+  if (phase === "queued") {
+    box.className = "state warn";
+    box.innerHTML = '<div class="title">⏳ 排队中…</div>' +
+      '<p class="desc">Redis 已经帮你把库存扣住了，接口先返回「排队中」。' +
+      '订单正在 Kafka 里等着被写进 MySQL，页面每 1 秒查一次，落库后会自动变成「已抢到」。' +
+      '<br />request_id：<code>' + esc(myRequestID.slice(0, 8)) + '…</code>' +
+      '（已经等了 ' + Math.round((Date.now() - queuedAt) / 1000) + ' 秒）</p>';
+    return;
+  }
+
+  if (phase === "won") {
+    box.className = "state ok";
+    box.innerHTML = '<div class="title">🎉 已抢到！</div>' +
+      '<p class="desc">数据库里已经生成订单 <b>#' + (wonOrder ? wonOrder.id : "-") + '</b>，' +
+      '状态：待付款。去 <a href="/shop#/orders">我的秒杀订单</a> 看完整的列表。<br />' +
+      '注意：这个订单号是<b>落库之后</b>才有的。抢购接口当时返回的只是「排队中」，' +
+      '所以页面没有立刻拿它去查订单——那个 ID 是 0。</p>';
+    return;
+  }
+
+  if (phase === "rejected") {
+    box.className = "state err";
+    box.innerHTML = '<div class="title">🙅 没抢到</div>' +
+      '<p class="desc">' + esc(reason) + '<br />' +
+      '这类拒绝属于<b>正常业务结果</b>，不是服务器故障：服务端返回 4xx，重试一万次结果也一样。' +
+      '（库存不足 / 已经买过 / 重复提交 / 活动时间不对 → 409，点太快 → 429）</p>';
+    return;
+  }
+
+  box.className = "state";
+  box.innerHTML = '<div class="title">还没开始抢</div>' +
+    '<p class="desc">点上面的按钮试试。抢购请求会先经过 Redis 判断「还有没有库存」，再排队进 Kafka。</p>';
+}
+
+/* ---------------- 抢购 ---------------- */
+/* 把 HTTP 状态码翻译成人话。409 的细分原因后端会写在 error 字段里，直接用它的。 */
+const ERR_HINT = {
+  400: "请求参数不合法",
+  401: "登录状态失效了，请重新登录",
+  404: "秒杀商品不存在",
+  429: "点太快被限流了：同一个用户每秒最多 100 次",
+  500: "服务端出错了，去看服务日志"
+};
+
+async function doSeckill() {
+  if (!item || !token) return;
+
+  const btn = $("seckillBtn");
+  btn.disabled = true;
+
+  /* request_id 是这次请求的「身份证」。网络抖动导致重试时，
+     服务端靠它认出「这单我已经收过了」，不会重复扣库存——
+     这就是幂等键，也是为什么抢购接口必须让客户端自己传一个唯一值。 */
+  myRequestID = crypto.randomUUID ? crypto.randomUUID()
+                                  : String(Date.now()) + "-" + Math.random();
+  phase = "queued";
+  queuedAt = Date.now();
+  renderState();
+  tick();
+
+  const t0 = performance.now();
+  const r = await api("/seckill/items/" + item.id + "/orders",
+                      { method: "POST", auth: true, body: { request_id: myRequestID, quantity: 1 } });
+  const cost = Math.round(performance.now() - t0);
+
+  if (r.ok) {
+    /* 200 只代表「排队成功」，不代表「已经抢到」。
+       真正的成交结果要等 checkLanded 查到订单才算数。 */
+    renderState();
+    checkLanded();
+    return;
+  }
+
+  phase = "rejected";
+  reason = "HTTP " + r.status + " · " + (r.data.error || ERR_HINT[r.status] || "未知错误") +
+           "（耗时 " + cost + "ms）";
+  renderState();
+}
+
+/* ---------------- 启动 ---------------- */
+$("seckillBtn").onclick = doSeckill;
+
+renderAccount();
+renderState();
+refresh();
+setInterval(refresh, 1000);
+setInterval(tick, 200);
+/* 排队中才去查订单，闲着的时候不打扰数据库 */
+setInterval(function () { if (phase === "queued") checkLanded(); }, 1000);
+</script>
+</body>
+</html>

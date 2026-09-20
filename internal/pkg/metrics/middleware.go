@@ -22,7 +22,10 @@ import (
 // 注意：只影响 HTTP 这一层统计。秒杀的成功/失败/重复/限流这些指标是由业务层
 // 主动上报的（见 seckill.Service.SetMetricsObserver），压根不经过这里，
 // 所以就算有人拿 /demo 页面去点，也不会污染压测口径的秒杀指标。
-var ignoredPrefixes = []string{"/demo", "/metrics"}
+//
+// 阶段 7 又多了 /shop：那是给用户看的独立前台，它每秒都在轮询 /shop/data 刷新库存。
+// 同一个道理——用户开着前台页面，不代表压测口径里的「业务请求」变多了。
+var ignoredPrefixes = []string{"/demo", "/metrics", "/shop"}
 
 // Middleware 是 Gin 的全局指标中间件。
 //

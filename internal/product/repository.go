@@ -9,6 +9,10 @@ type Repository interface {
 	List() ([]Product, error)
 	CreateSKU(s *SKU) error
 	FindSKUByProductAndSpec(productID uint, spec string) (*SKU, error)
+	// ListSKUsByProductIDs 一次查出多个商品的全部规格。
+	// 前台列表页要同时显示十几个商品，如果每个商品都单独查一次，就是典型的 N+1 次查询；
+	// 这里用一条 IN 查询全部取回，调用方自己按 product_id 分组。
+	ListSKUsByProductIDs(productIDs []uint) ([]SKU, error)
 	Delete(id uint) error
 }
 
@@ -73,6 +77,21 @@ func (r *repository) FindSKUByProductAndSpec(productID uint, spec string) (*SKU,
 	}
 
 	return &sku, nil
+}
+
+// ListSKUsByProductIDs 一次查出多个商品的全部规格，按 product_id、id 升序返回。
+// 空入参直接返回，避免拼出 `IN ()` 这种非法 SQL。
+func (r *repository) ListSKUsByProductIDs(productIDs []uint) ([]SKU, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+
+	var skus []SKU
+	if err := r.db.Where("product_id IN ?", productIDs).
+		Order("product_id asc, id asc").Find(&skus).Error; err != nil {
+		return nil, err
+	}
+	return skus, nil
 }
 
 // Delete 按 ID 删除商品。

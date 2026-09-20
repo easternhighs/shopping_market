@@ -25,6 +25,7 @@ import (
 	redispkg "shopping_market/internal/pkg/redis"
 	"shopping_market/internal/product"
 	"shopping_market/internal/seckill"
+	"shopping_market/internal/shop"
 	"shopping_market/internal/user"
 )
 
@@ -198,6 +199,17 @@ func main() {
 	// 「一键造数据」会往库里写数据，属于演示专用；启动时设置 DEMO_SEED=0 可以关掉它。
 	demoHandler.SetSeedEnabled(os.Getenv("DEMO_SEED") != "0")
 	demo.RegisterRoutes(r, demoHandler)
+
+	// 独立前台（阶段 7）：给用户看的商城页面，挂在 /shop 下。
+	// 和 /demo 的分工：/demo 讲「系统内部在干什么」，/shop 讲「用户看到了什么」。
+	// 它同样是纯新增的旁路功能，不参与抢购热路径；
+	// /shop 的访问也和 /demo 一样不计入 metrics 的业务总请求，
+	// 免得用户开着页面就把压测口径搅浑（见 internal/pkg/metrics/middleware.go）。
+	//
+	// 注意第三个参数：把 user 模块的鉴权中间件传进去，只有 /shop/my（查我的订单）需要登录。
+	// 页面本身不挂鉴权——得先能打开页面，才谈得上在里面登录。
+	shopHandler := shop.NewHandler(productService, seckillService)
+	shop.RegisterRoutes(r, shopHandler, userHandler.Auth)
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
 	go func() {
