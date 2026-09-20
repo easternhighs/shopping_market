@@ -67,6 +67,14 @@
   .line.info { color: var(--muted); }
   code { background: var(--inner); border: 1px solid var(--line);
          border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  /* 压测命令生成器：命令行要能整段选中复制，所以用 pre + 等宽字体，长命令自动换行不撑破卡片。 */
+  .cmdbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 14px 0 6px; }
+  .cmdbar span { color: var(--muted); font-size: 12.5px; }
+  pre.cmd { margin: 0 0 4px; padding: 10px 12px; background: var(--inner);
+            border: 1px solid var(--line); border-radius: 8px;
+            font: 12.5px/1.85 Consolas, "Cascadia Mono", monospace;
+            color: #cfe3ff; white-space: pre-wrap; word-break: break-all; cursor: text; }
+  .warnline { color: var(--amber); font-size: 12.5px; margin: 6px 0 0; }
 </style>
 </head>
 <body>
@@ -158,7 +166,72 @@
   </section>
 
   <section class="card">
-    <h2>⑥ 现场怎么演示</h2>
+    <h2>⑥ 压测命令生成器（压测交给 k6）</h2>
+    <p class="hint">
+      压测<b>故意不在服务端执行</b>，理由有三条：<br />
+      ① k6 和被测服务跑在同一台机器上会互相抢 CPU，压测端自己先成瓶颈。这一点
+      <code>docs/benchmark.md</code> 里有实测：同时开两个 k6 进程打同一个服务，
+      总吞吐反而从 16,000/s 掉到 13,000/s；<br />
+      ② 让一个 Web 接口去启动外部进程，本质上就是一条「远程命令执行」的风险面，演示项目没必要背这个锅；<br />
+      ③ 命令行的参数很容易记错（尤其是 <code>NS</code> 这一项），与其写死一句让人每次手改商品 ID，不如把参数做成表单。<br />
+      所以这一块只干一件事：<b>把参数拼成一条能直接粘贴运行的完整命令</b>。复制走，去另一个终端跑，本页负责看指标。
+    </p>
+    <div class="row">
+      <label>压测商品 <select id="k6Item" style="min-width:300px"></select></label>
+      <label>模式 <select id="k6Mode">
+        <option value="seckill">seckill · 打秒杀接口</option>
+        <option value="health">health · 只探连通性</option>
+      </select></label>
+    </div>
+    <div class="row">
+      <label>并发 VU <input id="k6Vus" type="number" value="256" min="1" max="100000" /></label>
+      <label>持续 <select id="k6Hold">
+        <option value="10s">10 秒</option>
+        <option value="30s">30 秒</option>
+        <option value="60s">60 秒</option>
+      </select></label>
+      <span class="hint" style="margin:0">常用档位</span>
+      <button class="ghost" data-vus="64">64</button>
+      <button class="ghost" data-vus="128">128</button>
+      <button class="ghost" data-vus="256">256</button>
+      <button class="ghost" data-vus="512">512</button>
+      <button class="ghost" data-vus="1024">1024</button>
+    </div>
+    <p class="hint">
+      档位怎么选（本机 20 核实测，见 <code>docs/benchmark.md</code>「A/B 实测」那张表）：
+      64 VU ≈ 10,400 QPS；<b>256 VU ≈ 16,100 QPS 是峰值档</b>；512 VU 之后反而回落，
+      因为瓶颈已经从代码转移到了单机网络栈。<b>「1 万 QPS」这个目标，64 VU 就已经越过了。</b><br />
+      两个必须知道的点：<code>VUS</code> 是并发虚拟用户数、<b>不等于 QPS</b>；
+      脚本固定往 <code>http://127.0.0.1:8080</code> 发压，所以 k6 要和本服务在同一台机器上跑。
+    </p>
+    <div class="cmdbar">
+      <span>第一步 · 复制命令，在<b>项目根目录</b>另开一个终端粘贴执行（商品 ID 已按上面的选择填好）：</span>
+      <button id="k6Copy">复制命令</button>
+    </div>
+    <pre id="k6Cmd" class="cmd"></pre>
+    <p class="warnline" id="k6Warn" style="display:none"></p>
+    <p class="hint">
+      命令里<b>故意不写 <code>NS</code></b>：脚本会用当前毫秒时间戳自动补一个命名空间。
+      这个参数<b>每轮必须不一样</b>——Redis 里的限购记录和幂等键会保留一段时间，
+      复用同一批 <code>user_id</code> / <code>request_id</code> 会被服务端正确地判成「重复请求」，
+      看起来就像系统有 Bug，其实只是压测参数写错了。<br />
+      <code>--summary-export</code> 会把本轮原始结果写进 <code>.tmp/k6_summary.json</code>；
+      压测脚本本身在 <code>.tmp/k6_bench.js</code>（<code>.tmp/</code> 不进版本库，换机器要自己拷一份）。
+    </p>
+    <div class="cmdbar">
+      <span>第二步（可选）· 压完把 k6 结果 + 服务端 <code>/metrics</code> 整理成一份 Markdown 报告：</span>
+      <button id="k6ReportCopy" class="ghost">复制命令</button>
+    </div>
+    <pre id="k6ReportCmd" class="cmd"></pre>
+    <p class="hint">
+      小提示：如果 <code>go run</code> 报「缓存目录没有权限」（在受限沙箱里跑会遇到这种情况），
+      先在当前终端执行 <code>$env:GOCACHE="$PWD\.gocache"</code> 再重试；在普通终端里不受影响。
+    </p>
+    <div id="k6Out" class="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>⑦ 现场怎么演示</h2>
     <p class="hint" style="margin-bottom:0">
       0）先点右上角「打开前台商城」：那是给<b>用户</b>看的独立前台（<code>/shop</code>），
       本页是给<b>面试官</b>看的仪表盘。两个页面看的是同一套后端，只是一个讲「用户看到了什么」，
@@ -166,7 +239,7 @@
       1）点「一键准备」，页面立刻有库存进度条和倒计时；<br />
       2）用 <code>demo1</code> 登录后点「立即抢购」——第一次成功，第二次会返回 409「您已经抢购过该商品」（这就是防重复购买）；<br />
       3）换个账号 <code>demo2</code> 再抢，库存数字同步往下掉；<br />
-      4）跑压测：<code>k6 run -e MODE=seckill -e VUS=256 -e HOLD=10s -e ITEM=&lt;上面的商品 ID&gt; k6_bench.js</code>，
+      4）跑到第 ⑥ 块点「复制命令」，在<b>另一个终端</b>（项目根目录）粘贴执行——商品 ID 已经帮你填好了；
       一边看「秒杀请求」往上冲、一边看 Redis 剩余掉到 0，同时「Kafka 在途订单」短暂变大后回落到 0（说明异步落库追平了）；<br />
       5）压测跑到十几秒时看第 ⑤ 块：会出现「突发流量：QPS 冲到 xxxx/s，平时约 0/s，越过门槛 500/s」这样的告警，
       压测停几秒后同一条规则会自动恢复——这就是「系统自己发现异常并说明原因」。
@@ -183,6 +256,8 @@ let current = null;
 let pending = 0;
 let serverOffset = 0;
 let renderedIds = "";
+let k6RenderedSig = null;   // 压测商品下拉框上次渲染用的「ID:剩余库存」指纹
+let k6ItemTouched = false;  // 用户是否手动选过压测商品（选过就不再自动跟随 ③ 的选择）
 
 /* ---------------- 小工具 ---------------- */
 function fmt(v) {
@@ -276,6 +351,7 @@ function renderItemList() {
   if (current) sel.value = String(current.id);
 
   renderItem();
+  renderK6Items();
 }
 
 function renderItem() {
@@ -562,6 +638,125 @@ function renderAlertEvents(events) {
   });
 }
 
+/* ---------------- ⑥ 压测命令生成器 ---------------- */
+/* 这里只拼命令、不起进程。核心原因有两条：
+   ① 压测端和被压的服务跑在同一台机器上会互相抢 CPU，测出来的吞吐会失真；
+   ② 让 Web 接口去 exec 外部进程，本质上是给演示项目开了一个远程命令执行的口子。
+   所以 k6 始终由人在另一个终端里手动跑，本页只负责把参数拼对、把指标展示好。 */
+const K6_SCRIPT = ".tmp/k6_bench.js";
+const K6_SUMMARY = ".tmp/k6_summary.json";
+
+function k6ItemId() {
+  const sel = $("k6Item");
+  return sel.value || (current ? String(current.id) : "");
+}
+
+function buildK6Command() {
+  const mode = $("k6Mode").value;
+  const vus = Math.max(1, num("k6Vus") || 256);
+
+  const parts = ["k6 run",
+                 "--summary-export " + K6_SUMMARY,
+                 "-e MODE=" + mode,
+                 "-e VUS=" + vus,
+                 "-e HOLD=" + $("k6Hold").value];
+  /* health 模式只打 /health，根本不碰秒杀接口，这时商品参数没有意义。 */
+  if (mode === "seckill" && k6ItemId()) parts.push("-e ITEM=" + k6ItemId());
+  parts.push(K6_SCRIPT);
+
+  return parts.join(" ");
+}
+
+function buildReportCommand() {
+  return "go run ./cmd/benchreport -k6 " + K6_SUMMARY + " -url http://127.0.0.1:8080";
+}
+
+function renderK6() {
+  const mode = $("k6Mode").value;
+  const sel = $("k6Item");
+
+  $("k6Cmd").textContent = buildK6Command();
+  $("k6ReportCmd").textContent = buildReportCommand();
+  sel.disabled = (mode === "health");
+
+  /* 库存为 0 的商品压出来全是「库存不足」，指标看着热闹、其实一单不成交——先提醒一句。 */
+  const it = items.find(function (x) { return String(x.id) === k6ItemId(); });
+  const warn = $("k6Warn");
+  if (mode === "seckill" && !k6ItemId()) {
+    warn.textContent = "⚠ 还没有可用的秒杀商品：先点第 ① 块「生成演示数据」。否则命令里不会带 ITEM 参数，" +
+                       "脚本会退回它自己的默认商品 ID，压出来全是「秒杀商品不存在」。";
+    warn.style.display = "";
+  } else if (mode === "seckill" && it && it.stock_ready && it.remaining_stock <= 0) {
+    warn.textContent = "⚠ 商品 #" + it.id + " 的 Redis 库存已经是 0：这一轮会全部落到「秒杀库存不足」，" +
+                       "不会有成交。演示前建议重新点一次「生成演示数据」，或换一个还有库存的商品。";
+    warn.style.display = "";
+  } else {
+    warn.style.display = "none";
+  }
+}
+
+function renderK6Items() {
+  const sel = $("k6Item");
+  const sig = items.map(function (it) {
+    return it.id + ":" + (it.stock_ready ? it.remaining_stock : "na");
+  }).join(",");
+
+  /* 标签里带实时库存，库存一变就重建；但如果用户正拉开下拉框挑商品，
+     重建会把列表合上，所以正在交互时就先不动。 */
+  if (sig !== k6RenderedSig && document.activeElement !== sel) {
+    const keep = sel.value;
+    sel.innerHTML = "";
+    if (items.length === 0) {
+      sel.appendChild(new Option("（还没有秒杀商品，先点上面的「生成演示数据」）", ""));
+    }
+    for (const it of items) {
+      const left = it.stock_ready ? (it.remaining_stock > 0 ? "剩 " + it.remaining_stock : "已抢光") : "未预热";
+      sel.appendChild(new Option("#" + it.id + " · " + it.activity_name + " · 共 " + it.total_stock + " 件 · " + left,
+                                 String(it.id)));
+    }
+    k6RenderedSig = sig;
+
+    if (items.some(function (it) { return String(it.id) === keep; })) sel.value = keep;
+    else if (items.length > 0) sel.value = k6ItemTouched ? String(items[0].id) : String((current || items[0]).id);
+  }
+
+  /* 用户没手动选过，就一直跟着上面 ③ 里选中的商品走。 */
+  if (!k6ItemTouched && current) sel.value = String(current.id);
+
+  renderK6();
+}
+
+function selectNode(node) {
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+async function copyText(text, okText) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      /* http:// 下浏览器不给用 clipboard API，退回「隐藏 textarea + 选中 + execCommand」的老办法。 */
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (!ok) throw new Error("浏览器拒绝了 execCommand('copy')");
+    }
+    log("k6Out", okText, "ok");
+  } catch (e) {
+    log("k6Out", "复制失败，请手动选中命令行再复制（" + e + "）", "warn");
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 $("seedBtn").onclick = doSeed;
 $("loginBtn").onclick = doLogin;
@@ -572,7 +767,28 @@ $("itemSelect").onchange = function () {
   current = items.find((it) => String(it.id) === this.value) || null;
   renderItem();
   tick();
+  renderK6Items();
 };
+
+/* 压测命令生成器的交互：改任何参数都重算一次命令行。 */
+$("k6Mode").onchange = renderK6;
+$("k6Vus").oninput = renderK6;
+$("k6Hold").onchange = renderK6;
+$("k6Item").onchange = function () { k6ItemTouched = true; renderK6(); };
+
+/* 档位快捷键：点一下就把 VU 数填进输入框，省得手打。 */
+document.querySelectorAll("[data-vus]").forEach(function (btn) {
+  btn.onclick = function () { $("k6Vus").value = this.dataset.vus; renderK6(); };
+});
+
+$("k6Copy").onclick = function () { copyText(buildK6Command(), "已复制压测命令，去另一个终端粘贴执行"); };
+$("k6ReportCopy").onclick = function () { copyText(buildReportCommand(), "已复制报告命令，压测跑完再执行"); };
+
+/* 点命令行就整段选中，方便手动 Ctrl+C。 */
+$("k6Cmd").onclick = function () { selectNode(this); };
+$("k6ReportCmd").onclick = function () { selectNode(this); };
+
+renderK6Items();
 
 checkHealth();
 refreshData();
