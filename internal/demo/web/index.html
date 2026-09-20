@@ -215,8 +215,8 @@
       这个参数<b>每轮必须不一样</b>——Redis 里的限购记录和幂等键会保留一段时间，
       复用同一批 <code>user_id</code> / <code>request_id</code> 会被服务端正确地判成「重复请求」，
       看起来就像系统有 Bug，其实只是压测参数写错了。<br />
-      <code>--summary-export</code> 会把本轮原始结果写进 <code>.tmp/k6_summary.json</code>；
-      压测脚本本身在 <code>.tmp/k6_bench.js</code>（<code>.tmp/</code> 不进版本库，换机器要自己拷一份）。
+      <code>--summary-export</code> 会把本轮原始结果写进 <code>.tmp/k6_summary.json</code>（这是产物，不进版本库）；
+      压测脚本本身在 <code>scripts/k6_bench.js</code>，<b>跟着版本库走</b>——换一台机器 clone 下来就能直接跑，不用另外拷文件。
     </p>
     <div class="cmdbar">
       <span>第二步（可选）· 压完把 k6 结果 + 服务端 <code>/metrics</code> 整理成一份 Markdown 报告：</span>
@@ -643,7 +643,7 @@ function renderAlertEvents(events) {
    ① 压测端和被压的服务跑在同一台机器上会互相抢 CPU，测出来的吞吐会失真；
    ② 让 Web 接口去 exec 外部进程，本质上是给演示项目开了一个远程命令执行的口子。
    所以 k6 始终由人在另一个终端里手动跑，本页只负责把参数拼对、把指标展示好。 */
-const K6_SCRIPT = ".tmp/k6_bench.js";
+const K6_SCRIPT = "scripts/k6_bench.js";
 const K6_SUMMARY = ".tmp/k6_summary.json";
 
 function k6ItemId() {

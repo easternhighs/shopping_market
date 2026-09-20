@@ -385,7 +385,7 @@ func writeK6Section(out *strings.Builder, k6 *k6Summary) {
 	}
 	out.WriteString("\n")
 
-	// 业务口径：k6 脚本自己打的计数器（见 .tmp/k6_bench.js）。
+	// 业务口径：k6 脚本自己打的计数器（见 scripts/k6_bench.js）。
 	// 光看 HTTP 200 是不够的——「库存不足」「超出限购」这类拒绝也是 200 或 4xx，
 	// 只有把它们分开计数，才知道这轮压测到底成功了多少单。
 	bizRows := []struct{ metric, label string }{
