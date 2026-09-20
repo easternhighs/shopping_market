@@ -13,7 +13,7 @@
   - 一致性复核：`sold` = 订单数 = 去重用户数 = 去重 `request_id` 数 = `SUM(quantity)` = **2,183,529**，Redis 剩余 **2,816,471** = 5,000,000 − 2,183,529；Kafka 6 个分区 LAG 全 0；日志 0 panic、0 补偿失败
   - 瓶颈定位（本轮重点结论）：用 pprof 采 20 秒 CPU profile（512 VU），**45.19% 在 `runtime.cgocall`**（阻塞式 socket 系统调用），其中 **42% 是 `net.(*conn).Write`**（把 HTTP 响应写回客户端），业务代码几乎不上榜；同时开两个 k6 进程总吞吐反而降到约 13,000/s，说明是**服务端已经饱和**、不是压测客户端发不动。**结论：再往上不是改代码的事，而是部署层面的事**（Linux/epoll、`GOMAXPROCS` 调参、HTTP 长连接、单机多实例 + 负载均衡）
   - 隔离基准：只打 Redis（1 次往返）约 34,000/s；Redis + Kafka 全链路约 30,500/s；只发 Kafka 约 86,200/s —— Kafka 不是瓶颈
-- 本次完成：**阶段 6.2 演示控制台：新增 `internal/demo` 包，让人一眼看见系统在干什么**（纯新增，没动后端业务逻辑）
+- 上一轮完成：**阶段 6.2 演示控制台：新增 `internal/demo` 包，让人一眼看见系统在干什么**（纯新增，没动后端业务逻辑）
   - `GET /demo`：单文件页面（`internal/demo/web/index.html`，用 `go:embed` 打进二进制，原生 JS，不需要 npm、不需要打包工具），深色主题，五个区块：一键准备 / 登录注册 / 独立秒杀页 / 实时观测 / 现场演示步骤
   - `GET /demo/data`：只读接口，把 MySQL 的 `total_stock`、`sold`，Redis 的 `remaining_stock`，Kafka 在途订单数 `pending` 拼成一份 JSON，页面每秒拉一次；`remaining_stock` 用指针字段，好区分「还没预热（null）」和「真的卖光了（0）」
   - `POST /demo/seed`：一键造数据——商品 → SKU → 库存 → 秒杀活动（`now-5min` ~ `now+2h`）→ 秒杀商品 → 预热 Redis → 演示账号（`demo1..demoN`，密码 `demo1234`）。幂等：重复点不会造重复数据，只有秒杀活动每次新建；`DEMO_SEED=0` 启动即可关掉（返回 403）
