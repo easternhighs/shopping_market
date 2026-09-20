@@ -1,4 +1,4 @@
-.PHONY: run build env-up env-down logs kafka-partitions kafka-lag
+.PHONY: run build env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -25,3 +25,9 @@ kafka-partitions:
 # 查看消费组堆积情况：LAG 归零说明消费端已经追上生产速度。
 kafka-lag:
 	docker exec shopping_market_kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group shopping_market_seckill --describe
+
+# 汇总一份压测报告：k6 的 summary、服务端指标（/metrics*）、服务日志三份材料拼成一份 Markdown。
+# 用法：make bench-report K6=.tmp/k6_summary.json LOG=.tmp/srv_demo.log
+# 不传参数也能跑（服务还活着的话，至少能出服务端那一节）；报告打印在屏幕上，方便直接贴。
+bench-report:
+	go run ./cmd/benchreport -k6 "$(K6)" -log "$(LOG)" -out -

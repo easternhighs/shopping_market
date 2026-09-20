@@ -208,7 +208,8 @@ shopping_market/
   - `DEMO_SEED=0` 启动 → `POST /demo/seed` 返回 403，`GET /demo` 仍 200。
 - 完成标志：打开页面点一下就能完成一次抢购，并且能同时看到压测指标在动。**已达成。**
 - 风险：低。纯新增，不动后端业务逻辑。
-#### 6.3 AI 辅助可观测（可选，贴着主线做）
+
+#### 6.3 AI 辅助可观测（已完成）
 
 - 目标：让系统自己发现异常，而不是靠人盯屏幕。
 - 明确不做的事：**不做 LLM 导购 / 聊天推荐**。秒杀的设计目标就是把绝大多数流量挡在门外，
@@ -219,6 +220,23 @@ shopping_market/
   - 自适应限流：按实时负载动态调整限流阈值，接在现有 `internal/pkg/ratelimit` 旁边。
 - 完成标志：能演示「压测中系统自己报出异常并说明原因」。
 - 风险：低到中。都属于旁路功能，不影响主链路。
+- **实测结果（已完成）**：
+  - 新增代码：`internal/pkg/metrics`（`metrics.go` 补齐错误数/平均延迟/并发数，`window.go` 采样器，
+    `alert.go` 告警引擎，`rules.go` 四条默认规则，`http.go` 两条只读接口）、
+    `internal/pkg/kafka/lag.go`（消费组积压探针）、`internal/pkg/ratelimit/adaptive.go`（自适应限流）、
+    `cmd/benchreport`（压测报告工具），并在 `cmd/server/main.go` 里接线、给演示页加了第 ⑤ 区块。
+  - 告警实测：256 VU 压 20 秒，系统自己在 `15:40:05` 打出
+    「突发流量：QPS 冲到 4705/s……越过门槛 500/s」，`15:40:27` 自动打出恢复事件（持续 22 秒、峰值 5257.7）；
+    全程 5xx 峰值 0%、Kafka LAG 峰值 0、在途订单峰值 0。
+  - 性能代价：`gofmt -l cmd internal` 无输出、`go vet ./...` 通过、`go build` 成功；
+    同一条件 A/B 对比（256 VU / 20 秒）：加观测前 112,631 请求 / 平均 47.7ms / p99 60.0ms，
+    加观测后 108,353 请求 / 平均 QPS 4,918 / p99 65.18ms —— **QPS 没有可见下降**
+    （中间件每个请求多 3 次原子加法，纳秒级）。
+  - 报告工具用法：
+    `go run ./cmd/benchreport -k6 .tmp/k6_summary.json -log .tmp/srv_demo.log -out -`
+    （`-out -` 只打印；不填 `-out` 会写到 `docs/reports/bench-<时间>.md`，样例见 `docs/reports/stage63-verify.md`）。
+  - 已知限制：`/metrics/history` 一次可能返回几百 KB（900 个样本）；告警只活在本进程内存里，
+    进程挂了就没人报，要外部告警得接 Prometheus + Alertmanager。
 
 #### 阶段 6 总完成标志
 
@@ -226,6 +244,9 @@ shopping_market/
 - 库存不超卖、同一用户不重复、Redis 与 MySQL 账目自洽；
 - 产出架构图、优化过程文档和面试讲解稿；
 - 有一个可以现场演示的控制台。
+
+**以上四条全部达成，阶段 6 完成。**另外 6.3 让系统能在压测中自己报出异常并给出排查方向，
+演示时不需要人盯屏幕。
 
 ## 8. 挖空式协作规则
 

@@ -79,9 +79,18 @@ func main() {
 	appMetrics := metrics.NewMetrics()
 	r.Use(metrics.Middleware(appMetrics))
 
+	// 6.3 可观测性（旁路功能，不在抢购链路上）：
+	//   - 指标只知道自己「一共」干了多少活，看不出「现在」快不快；
+	//   - 采样器每隔 2 秒把累计值换算成速率（每秒多少），攒成一条历史曲线；
+	//   - 告警引擎拿当前值和「平时」比，持续偏离就自己报出来。
+	// 采样间隔 2 秒、保留 900 个样本（约半小时），够覆盖一次完整的压测。
+	alertEngine := metrics.NewEngine(metrics.DefaultRules(), log.Printf)
+	sampler := metrics.NewSampler(appMetrics, alertEngine, 2*time.Second, 900)
+
 	// 健康检查：用来确认服务还活着。
 	r.GET("/health", healthHandler)
 	r.GET("/metrics", gin.WrapH(appMetrics.Handler()))
+	metrics.RegisterObservabilityRoutes(r, sampler, alertEngine)
 
 	// 用户模块路由。
 	userRepo := user.NewRepository(dbConn)
@@ -150,12 +159,36 @@ func main() {
 	seckillService.SetRateLimitObserver(appMetrics.ObserveRateLimited)
 	seckillHandler := seckill.NewHandler(seckillService)
 	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
+	// 自适应限流（6.3）：100 次/秒仍然是硬上限，但系统吃力时会自己往下收紧。
+	// 判据是「平均延迟超过 50ms 或开始报 5xx」，规则见 internal/pkg/ratelimit/adaptive.go。
+	adaptiveController := ratelimit.NewController(5, 100, 50*time.Millisecond)
 	// 限流中间件只挂在秒杀的管理类接口上（建活动、查活动、建商品）。
 	// 抢购接口不带中间件：它的限流和库存扣减共用同一次 Redis 往返，
 	// 再套一层中间件就等于把刚省下来的往返又加回去（见 internal/seckill/cache.go 的 hotPathLuaScript）。
 	seckillGroup := protected.Group("/")
-	seckillGroup.Use(ratelimit.RateLimit(seckillRateLimiter, 100, time.Second, appMetrics.ObserveRateLimited))
+	seckillGroup.Use(ratelimit.RateLimit(ratelimit.NewAdaptiveLimiter(seckillRateLimiter, adaptiveController), 100, time.Second, appMetrics.ObserveRateLimited))
 	seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
+
+	// LAG 探针：每 5 秒问一次 Kafka「消费组落后多少条消息」，把答案留在内存里。
+	// 采样器只读缓存，不做网络请求，所以采样节奏不会被 Kafka 拖慢（见 internal/pkg/kafka/lag.go）。
+	lagProbe := kafkapkg.NewLagProbe(kafkaBrokers, kafkaTopic, kafkaGroupID, 5*time.Second)
+
+	// 把采样结果接到自适应控制器上：每个窗口结束喂一次「平均延迟 + 错误率」。
+	sampler.SetObserver(func(sample metrics.Sample) {
+		adaptiveController.Observe(
+			sample.Values[metrics.MetricAvgLatencyMS],
+			sample.Values[metrics.MetricErrorRate],
+		)
+	})
+	// 再给采样器补上三个它自己看不到的数：
+	// Kafka LAG（要问 Kafka）、在途订单数（在秒杀模块里）、当前限流阈值（在限流器里）。
+	sampler.SetExtra(func() map[string]float64 {
+		return map[string]float64{
+			metrics.MetricKafkaLag:      float64(lagProbe.Lag()),
+			metrics.MetricPending:       float64(seckillService.Pending()),
+			metrics.MetricAdaptiveLimit: float64(adaptiveController.Current()),
+		}
+	})
 
 	// 演示控制台（阶段 6.2）：把已经搭好的 user / product / inventory / seckill
 	// 四个模块串起来，挂在 /demo 下。它是纯新增的旁路功能，不参与抢购热路径；
@@ -175,6 +208,13 @@ func main() {
 
 	// 启动库存对账任务：每隔一段时间，用 MySQL 的 sold 修正 Redis 库存。
 	go seckillService.ReconcileLoop(context.Background(), 30*time.Second)
+
+	// 启动 6.3 的两个后台任务：采样循环和 LAG 探针。
+	// 它们都退出得很干脆（ctx 一取消就返回），进程退出时不会拖着不放。
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
+	lagProbe.Start(runCtx)
+	go sampler.Run(runCtx)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {

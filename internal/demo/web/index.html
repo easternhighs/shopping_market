@@ -141,13 +141,29 @@
   </section>
 
   <section class="card">
-    <h2>⑤ 现场怎么演示</h2>
+    <h2>⑤ 系统自己报异常（AI 辅助可观测）</h2>
+    <p class="hint">
+      这一块<b>不是</b>让 AI 推荐商品，而是让系统自己发现问题：给 QPS、5xx 错误率、Kafka 积压各建一条「平时是多少」的基线，
+      连续几个采样窗口明显偏离就报警，并用一句人话说清发生了什么、该去看哪里。
+      判断用的是统计方法（基线均值 ± N 倍波动 + 绝对下限），不依赖任何外部大模型，断网也能跑。<br />
+      门槛 = 「基线 + N 倍波动」和「绝对下限」里更严的那个。注意：秒杀时 QPS 冲到几千是<b>预期行为</b>（
+      有下限兜着才不会一有流量就报），真正要紧的是<b>错误率</b>和<b>积压</b>——这两个涨起来才说明系统扛不住了。
+    </p>
+    <div class="row" id="alertBanner"></div>
+    <div class="grid" id="ruleGrid"></div>
+    <div id="alertOut" class="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>⑥ 现场怎么演示</h2>
     <p class="hint" style="margin-bottom:0">
       1）点「一键准备」，页面立刻有库存进度条和倒计时；<br />
       2）用 <code>demo1</code> 登录后点「立即抢购」——第一次成功，第二次会返回 409「您已经抢购过该商品」（这就是防重复购买）；<br />
       3）换个账号 <code>demo2</code> 再抢，库存数字同步往下掉；<br />
       4）跑压测：<code>k6 run -e MODE=seckill -e VUS=256 -e HOLD=10s -e ITEM=&lt;上面的商品 ID&gt; k6_bench.js</code>，
-      一边看「秒杀请求」往上冲、一边看 Redis 剩余掉到 0，同时「Kafka 在途订单」短暂变大后回落到 0（说明异步落库追平了）。
+      一边看「秒杀请求」往上冲、一边看 Redis 剩余掉到 0，同时「Kafka 在途订单」短暂变大后回落到 0（说明异步落库追平了）；<br />
+      5）压测跑到十几秒时看第 ⑤ 块：会出现「突发流量：QPS 冲到 xxxx/s，平时约 0/s，越过门槛 500/s」这样的告警，
+      压测停几秒后同一条规则会自动恢复——这就是「系统自己发现异常并说明原因」。
     </p>
   </section>
 </main>
@@ -470,6 +486,76 @@ function renderMetrics(m) {
   $("metricsGrid").innerHTML = cells.join("");
 }
 
+/* ---------------- 6.3 告警：系统自己报异常 ---------------- */
+async function pollAlerts() {
+  try {
+    const res = await fetch("/metrics/alerts");
+    if (!res.ok) return;
+    renderAlerts(await res.json());
+  } catch (e) { /* 下一轮再试 */ }
+}
+
+function renderAlerts(d) {
+  const active = d.active || [];
+
+  // 横幅只回答一个问题：现在有没有事。
+  const banner = [];
+  if (active.length === 0) {
+    banner.push('<span class="pill ok">目前没有异常</span>');
+  } else {
+    active.forEach((a) => {
+      banner.push('<span class="pill bad">' + a.rule + ' ' + fmt(Math.round(a.value)) + '（已持续 ' +
+        Math.round(a.elapsed_seconds) + ' 秒）</span>');
+    });
+  }
+  $("alertBanner").innerHTML = banner.join("");
+
+  // 规则卡片：把「当前值」和「门槛」并排显示。
+  // 只说「正在告警」没说服力，能同时给出「平时是多少」才让人信服。
+  const rules = d.rules || [];
+  $("ruleGrid").innerHTML = rules.map(function (r) {
+    const threshold = Math.max(r.floor || 0, (r.baseline || 0) + (r.sigma || 0) * (r.stddev || 0));
+    const cur = r.has_current ? fmt(round2(r.current)) : "—";
+    return '<div class="cell"><span>' + r.name + (r.active ? " ⚠ 告警中" : "") + '</span>' +
+           '<b>' + cur + '</b>' +
+           '<span>门槛 ' + fmt(round2(threshold)) + ' ｜ 平时 ' + fmt(round2(r.baseline)) + '</span></div>';
+  }).join("");
+
+  renderAlertEvents(d.events || []);
+}
+
+function round2(v) {
+  return Math.round(Number(v) * 100) / 100;
+}
+
+// 事件用 textContent 逐条写，不走 innerHTML：告警文案是服务端拼的字符串，
+// 直接塞进 HTML 里以后万一文案里带了尖括号就会把页面搞乱。
+function renderAlertEvents(events) {
+  const box = $("alertOut");
+  box.innerHTML = "";
+
+  if (events.length === 0) {
+    const line = document.createElement("div");
+    line.className = "line info";
+    line.textContent = "还没有发生过告警状态变化。压测跑起来之后，这里会出现系统自己报出来的异常和恢复记录。";
+    box.appendChild(line);
+    return;
+  }
+
+  events.slice(0, 5).forEach(function (e) {
+    const line = document.createElement("div");
+    line.className = "line " + (e.kind === "firing" ? "err" : "ok");
+
+    let text = "[" + new Date(e.at).toLocaleTimeString() + "] " +
+      (e.kind === "firing" ? "开始告警" : "已恢复") + " · " + e.rule;
+    if (e.kind === "resolved") {
+      text += "（持续 " + Math.round(e.duration_seconds) + " 秒，期间峰值 " + fmt(round2(e.peak)) + "）";
+    }
+    line.textContent = text + "\n    " + e.reason;
+    box.appendChild(line);
+  });
+}
+
 /* ---------------- 启动 ---------------- */
 $("seedBtn").onclick = doSeed;
 $("loginBtn").onclick = doLogin;
@@ -485,9 +571,11 @@ $("itemSelect").onchange = function () {
 checkHealth();
 refreshData();
 pollMetrics();
+pollAlerts();
 
 setInterval(refreshData, 1000);
 setInterval(pollMetrics, 1000);
+setInterval(pollAlerts, 2000);
 setInterval(tick, 200);
 setInterval(checkHealth, 5000);
 </script>
