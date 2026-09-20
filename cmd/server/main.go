@@ -317,6 +317,9 @@ func seckillPayTimeout() time.Duration {
 
 	raw := strings.TrimSpace(os.Getenv(envKey))
 	if raw == "" {
+		// 默认值也要打一行日志：不然只看启动日志根本分不清「没配」和「配了但没生效」，
+		// 而付款时限直接决定订单多久会被关掉，属于排障时必须一眼能看到的信息。
+		log.Printf("秒杀付款时限使用默认值 %s（想改短可设置 %s，例如 30s）", seckill.DefaultPayTimeout, envKey)
 		return seckill.DefaultPayTimeout
 	}
 
