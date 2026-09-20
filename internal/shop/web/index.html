@@ -71,6 +71,7 @@
   <nav>
     <a id="navProducts" href="#/products">全部商品</a>
     <a id="navOrders" href="#/orders">我的秒杀订单</a>
+    <a href="/shop/cart">购物车</a>
     <a href="/demo" target="_blank">演示控制台 ↗</a>
   </nav>
   <div class="account" id="account"></div>
@@ -78,6 +79,7 @@
 
 <main>
   <div class="banner" id="banner"><span class="pill">正在加载商品…</span></div>
+  <div class="msg" id="flash"></div>
   <div id="view"></div>
 </main>
 
@@ -110,6 +112,12 @@ function esc(s) {
 
 function fmt(v) {
   return (v === null || v === undefined) ? "-" : Number(v).toLocaleString();
+}
+
+function flash(text, ok) {
+  const box = $("flash");
+  box.className = "msg " + (ok ? "ok" : "err");
+  box.textContent = text || "";
 }
 
 function durText(ms) {
@@ -232,6 +240,31 @@ async function doRegister() {
   }
 }
 
+/* ============================================================
+   留给你实现的部分
+   ============================================================ */
+
+/* TODO(你来实现)：把一个规格加进购物车。
+   「商品详情」表格里每一行的「加入购物车」按钮，点了就会走到这里。
+
+   输入：skuID —— 规格 ID（表格里的按钮和数量框都带着它）
+        quantity —— 用户填的数量
+   要做的：
+     1. 没登录就别发请求（token 为空时直接用 flash 提示「请先登录」）。
+     2. 调接口：
+            const r = await api("/cart/items", { method: "POST", auth: true,
+                                                 body: { sku_id: skuID, quantity: quantity } });
+        注意接口要的字段名是 sku_id（下划线），不是 skuID —— 服务端的 JSON 标签就是这么定的。
+     3. r.ok 就 flash("已加入购物车，点顶部「购物车」去结算", true)；
+        否则把服务端的错误显示出来：flash("加入失败：HTTP " + r.status + " " + (r.data.error || ""), false)。
+     4. 别忘了 await；数量非法（小于 1）时先提示，不要发请求。
+
+   想一想：同一个 SKU 加两次会发生什么？去看 internal/cart/service.go 的 AddItem ——
+   服务端会找到已有明细把数量叠加上去，而不是插一条重复的记录。这样购物车里
+   一个规格永远只有一行，结算时不用先合并。 */
+async function addToCart(skuID, quantity) {
+}
+
 /* ---------------- 数据轮询 ---------------- */
 async function refreshCatalog() {
   try {
@@ -240,8 +273,16 @@ async function refreshCatalog() {
     catalog = await res.json();
     serverOffset = new Date(catalog.server_time).getTime() - Date.now();
     renderBanner();
-    render();
+    /* 用户正在「加入购物车」的数量框里打字时先不重绘：
+       这个页面每秒刷一次，重绘会把输入框里的数字冲回 1，人会以为键盘坏了。 */
+    if (!isEditing()) render();
   } catch (e) { /* 轮询失败就静默跳过，下一秒再试 */ }
+}
+
+/* isEditing 判断用户此刻是不是正在页面里的输入框中打字。 */
+function isEditing() {
+  const el = document.activeElement;
+  return !!(el && el.tagName === "INPUT" && el.closest && el.closest("#view"));
 }
 
 async function refreshOrders() {
@@ -356,14 +397,20 @@ function renderProductDetail(id) {
       action = '<a class="btn" href="/shop/seckill?item=' + hot.id + '">立即秒杀 ¥' + hot.price + '</a>';
     }
 
-    return '<tr><td>' + esc(s.spec) + '</td><td>¥' + s.price + '</td><td>' + state + '</td><td>' + action + '</td></tr>';
+    /* 加入购物车：数量框 + 按钮。点按钮的活由页面底部的「事件委托」统一处理，
+       这样每秒重绘一次也不用重新绑事件。 */
+    const toCart = '<input id="addqty-' + s.id + '" type="number" min="1" value="1" style="width:64px" /> ' +
+                   '<button class="ghost" data-add-cart="' + s.id + '">加入购物车</button>';
+
+    return '<tr><td>' + esc(s.spec) + '</td><td>¥' + s.price + '</td><td>' + state + '</td>' +
+           '<td>' + action + '</td><td>' + toCart + '</td></tr>';
   }).join('');
 
   return '<div class="panel">' +
     '<p class="hint" style="margin:0 0 10px"><a href="#/products">← 返回商品列表</a></p>' +
     '<h2>' + esc(p.name) + '</h2>' +
     '<p class="hint">' + esc(p.description) + '</p>' +
-    '<table><tr><th>规格</th><th>价格</th><th>状态</th><th>操作</th></tr>' +
+    '<table><tr><th>规格</th><th>价格</th><th>状态</th><th>秒杀</th><th>购物车</th></tr>' +
     (rows || '<tr><td colspan="4">这个商品还没有规格</td></tr>') +
     '</table></div>' +
     '<div class="panel"><h2>为什么秒杀要单独开一个页面</h2>' +
@@ -448,6 +495,16 @@ function render() {
 }
 
 window.addEventListener("hashchange", render);
+
+/* 「加入购物车」按钮是渲染出来的（商品详情里每个规格一个），所以用事件委托：
+   在 #view 上挂一个监听就够，比每次重绘都重新绑一遍省事，也不会因为重绘漏绑。 */
+$("view").addEventListener("click", function (ev) {
+  const btn = ev.target.closest("[data-add-cart]");
+  if (!btn) return;
+  const skuID = Number(btn.dataset.addCart);
+  const box = $("addqty-" + skuID);
+  addToCart(skuID, box ? Number(box.value) : 1);
+});
 
 renderAccount();
 render();

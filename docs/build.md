@@ -650,6 +650,65 @@ shopping_market/
 - 完成标志：`k6 inspect` 能解析 `scripts/` 下两个脚本；按附录 B 实跑走通
   「抢到 → 倒计时 → 超时关单 → 库存回补」；`gofmt` / `go vet` / `go build` 全部通过。**已达成。**
 
+### 阶段 12：购物车与结算页（进行中）
+
+- 为什么补这一章：前 11 个阶段把「秒杀」这条链路做到了能扛 1 万 QPS，但面试官几乎一定会追问一句
+  「那**普通下单**你们怎么做？」。阶段 3 早就写好了购物车与订单接口，只是一直没有页面能点，
+  现场只能靠 curl，讲起来很干。这一章把前台补上，让同一次演示里能并排看到**两条下单链路**：
+  常规链路（同步事务、强一致、库存直接扣 MySQL）和秒杀链路（Redis 预扣 + Kafka 异步落库、最终一致）。
+- 设计边界（刻意不做的事）：
+  - **秒杀链路完全不动**。这一章只加前台页面，不碰 Redis 脚本、不碰 Kafka、不碰任何压测过的热路径，
+    所以阶段 6 的压测结论依旧成立。
+  - **金额只在前端算**。`orders` 表没有金额列（阶段 3 的已知简化），页面上的「小计 / 合计」是拿
+    `GET /shop/data` 里的价格在浏览器里乘出来的。真做电商必须在服务端重算并落库，这一点页面注释里写明了。
+  - **页面公开、数据靠接口鉴权**。`/shop`、`/shop/seckill`、`/shop/cart` 都是公开 HTML，
+    但页面里拉的 `/cart/items`、`/orders` 等接口都过 JWT 中间件，未登录拿不到任何私有数据。
+- 新增内容：
+  - `internal/shop/web/cart.html`：购物车 + 结算页。明细表（商品 / 规格 / 单价 / 数量 / 小计 / 操作）、
+    改数量、删除、合计、可展开的结算面板（收货信息表单，仅本地校验、不发给后端）、提交订单、模拟支付、
+    订单详情回显。页底还有两块面试话术：「留给你实现的部分」清单、同步事务与异步最终一致的对比。
+  - `internal/shop/web/index.html` 商品列表页：导航加「购物车」入口；商品行新增「购物车」列
+    （数量框 + 加入按钮）；给 1 秒一次的自动刷新加了 `isEditing()` 判断，
+    避免重绘把正在输入的数字冲掉。
+  - 三个页面导航互通，登录态共用同一个 `localStorage` 键，登录一次三个页面都认。
+- 后端只做了最小改动（都是为了让页面能跑，不是为了改功能）：
+  - `internal/shop/handler.go`：`//go:embed web/cart.html` + `CartPage`。
+  - `internal/shop/router.go`：注册 `GET /shop/cart`。
+  - 页面对接的全是阶段 3 就已经存在的接口，没有新增业务接口：
+
+    | 页面动作 | 调用的接口 |
+    | --- | --- |
+    | 打开购物车 | `GET /cart/items` |
+    | 加入购物车 | `POST /cart/items` |
+    | 改数量 | `PATCH /cart/items/:item_id` |
+    | 删除明细 | `DELETE /cart/items/:item_id` |
+    | 提交订单 | `POST /orders` |
+    | 模拟支付 | `POST /orders/:id/pay` |
+    | 商品名 / 规格 / 单价 | `GET /shop/data`（前端查表拼接） |
+
+- **留给你填的空（5 个）**——按挖空规则，这些函数体里只有注释和 `TODO(你来实现)`：
+
+  | 文件 | 函数 | 它要做什么 |
+  | --- | --- | --- |
+  | `internal/shop/web/cart.html` | `findSKU(skuID)` | 从 `/shop/data` 里按 sku_id 查出商品、规格、单价；查不到返回 `null` |
+  | `internal/shop/web/cart.html` | `cartTotal()` | 逐行「单价 × 数量」求和，得到合计金额 |
+  | `internal/shop/web/cart.html` | `placeOrder()` | 生成唯一 `request_id`（幂等键）→ 把 `cartItems` 映射成 `{sku_id, quantity}` → `POST /orders` → 成功就存下订单、清空购物车 |
+  | `internal/shop/web/cart.html` | `payOrder(orderID)` | `POST /orders/:id/pay`，成功后把状态改成 `paid` 再重绘 |
+  | `internal/shop/web/index.html` | `addToCart(skuID, quantity)` | 商品页的「加入购物车」按钮，`POST /cart/items` |
+
+- **第 6 个空是一道安全题**：实测发现 `demo2` 能改甚至删掉 `demo1` 的购物车明细，也能读别人的订单，
+  这是典型的**越权（IDOR）**。仓储层已经补好 `FindItemByIDForUser(itemID, userID)`
+  （一条 JOIN 把 `carts.user_id` 带进来），`internal/cart/service.go` 的
+  `UpdateQuantity` / `RemoveItem` 已改成接收 `userID`，**函数体留空**，
+  等你自己加上「这条明细是不是你的」校验。订单侧同样有问题，但为免范围蔓延，只在文档里说明、不动代码。
+- 怎么验证（按顺序走一遍就算完成）：
+  1. `go build ./...` 通过，起服务；
+  2. 浏览器打开 `/shop/cart`，用 `demo1` / `demo1234` 登录；
+  3. 去 `/shop` 加购，回购物车看到明细、数量、合计都对；
+  4. 改数量、删除各试一次；
+  5. 填收货信息提交订单，确认弹出的**订单号是真实自增号（不是 0）**，再点「模拟支付」看到状态变 `paid`；
+  6. 换 `demo2` 登录，尝试改 `demo1` 的明细，应该被拒绝（做完第 6 个空之后）。
+- 完成标志：上面 6 步走通、越权被挡下，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

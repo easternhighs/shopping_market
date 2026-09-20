@@ -2,6 +2,13 @@ package cart
 
 import "errors"
 
+// ErrItemNotOwned 表示这条购物车明细不属于当前用户，或者压根不存在。
+//
+// 为什么不给这个错误起名叫「这不是你的明细」：那样等于告诉攻击者「这个 id 是存在的，
+// 只是不归你」——光这一句就是一条有用的情报，他可以把 id 从小到大试一遍，
+// 数出别人有多少条明细。所以对外统一说「不存在」。
+var ErrItemNotOwned = errors.New("购物车明细不存在")
+
 // Service 是购物车模块的业务层。
 type Service struct {
 	repo Repository
@@ -73,14 +80,40 @@ func (s *Service) List(userID uint) ([]Item, error) {
 }
 
 // UpdateQuantity 更新明细数量。
-func (s *Service) UpdateQuantity(itemID uint, quantity int) error {
+//
+// TODO(你来实现)：这里有一个【越权漏洞】，请把它补上（RemoveItem 是同款，一起改）。
+//
+// 现在的问题：函数只认 itemID，不认人。任何登录用户只要把 id 猜出来（就是 1、2、3 ……），
+// 就能改别人的购物车。我实测过：用 demo2 登录，成功把 demo1 的明细数量从 2 改成了 999。
+// 前端页面是「看不到」别人的明细 ID 的，但攻击者不需要页面——他拿自己的令牌直接 curl 打接口。
+//
+// 要做的两步（顺序别颠倒）：
+//  1. 问一句「这条明细是不是这个用户的」：
+//     owned, err := s.repo.FindItemByIDForUser(itemID, userID)
+//     if err != nil { return err }
+//  2. owned 是 nil 就 return ErrItemNotOwned，后面的更新一行都别执行。
+//     确认是自己的，才调用 s.repo.UpdateItemQuantity(itemID, quantity)。
+//
+// 顺带想想为什么归属判断要写进 SQL（仓储里那个 JOIN），而不是「先查出来再比较 item.CartID」：
+// 一条 SQL 就够，省一次数据库往返；更重要的是，条件写在查询里，调用方就没有「忘了比较」的机会。
+func (s *Service) UpdateQuantity(userID, itemID uint, quantity int) error {
 	if quantity <= 0 {
 		return errors.New("数量必须大于 0")
 	}
+
+	// TODO(你来实现)：归属校验。现在这里什么都没做，所以谁都能改。
+	_ = userID
+
 	return s.repo.UpdateItemQuantity(itemID, quantity)
 }
 
 // RemoveItem 删除明细。
-func (s *Service) RemoveItem(itemID uint) error {
+//
+// TODO(你来实现)：和 UpdateQuantity 一样，先做归属校验，通过了再调用 s.repo.DeleteItem(itemID)。
+// 删除比修改更危险：改错了还能改回来，删掉就是真的没了。
+func (s *Service) RemoveItem(userID, itemID uint) error {
+	// TODO(你来实现)：归属校验。现在这里什么都没做，所以谁都能删。
+	_ = userID
+
 	return s.repo.DeleteItem(itemID)
 }

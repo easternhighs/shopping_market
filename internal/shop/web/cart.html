@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>购物车与结算 · 秒购商城</title>
+<style>
+  :root {
+    --bg: #0e131a; --card: #161d27; --inner: #10161f; --line: #26313f;
+    --text: #e6edf3; --muted: #8b98a9;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #4493f8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.65 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  a { color: var(--blue); text-decoration: none; }
+  header { display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+           padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--card); }
+  header .brand b { font-size: 17px; }
+  header .brand .sub { display: block; color: var(--muted); font-size: 12px; }
+  header nav { display: flex; gap: 6px; }
+  header nav a { padding: 5px 12px; border-radius: 999px; color: var(--muted); font-size: 13px; }
+  header nav a.on { background: #1e2733; color: var(--text); }
+  header .account { margin-left: auto; display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px 24px 60px; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 12px;
+          background: #1e2733; color: var(--muted); white-space: nowrap; }
+  .pill.ok { background: rgba(63,185,80,.16); color: var(--green); }
+  .pill.warn { background: rgba(210,153,34,.16); color: var(--amber); }
+  .pill.bad { background: rgba(248,81,73,.16); color: var(--red); }
+  input, button { font: inherit; border-radius: 6px; border: 1px solid var(--line);
+                  background: var(--inner); color: var(--text); padding: 6px 10px; }
+  button, .btn { background: var(--blue); border: 1px solid var(--blue); color: #fff;
+                 cursor: pointer; font-weight: 500; padding: 6px 12px; border-radius: 6px;
+                 display: inline-block; font-size: 13px; }
+  button.ghost, .btn.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .banner { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+            background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 12px 16px; margin-bottom: 14px; }
+  .banner .name { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .panel { background: var(--card); border: 1px solid var(--line);
+           border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .panel h2 { margin: 0 0 6px; font-size: 15px; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 12px; }
+  .empty { color: var(--muted); padding: 26px 0; text-align: center; }
+  code { background: var(--inner); border: 1px solid var(--line);
+         border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .msg { font-size: 12.5px; margin: 8px 0; min-height: 18px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--red); }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .totals { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+            margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .totals .sum { font-size: 20px; font-weight: 600; color: var(--amber); }
+  td.ops { white-space: nowrap; }
+  td.ops button { margin-right: 6px; }
+  .form { display: flex; gap: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <b>🛒 秒购商城</b>
+    <span class="sub">购物车与结算 · 普通下单链路</span>
+  </div>
+  <nav>
+    <a href="/shop#/products">全部商品</a>
+    <a href="/shop#/orders">我的秒杀订单</a>
+    <a class="on" href="/shop/cart">购物车</a>
+    <a href="/demo" target="_blank">演示控制台 ↗</a>
+  </nav>
+  <div class="account" id="account"></div>
+</header>
+
+<main>
+  <div class="banner" id="banner"><span class="pill">正在加载…</span></div>
+  <div class="msg" id="flash"></div>
+  <div id="view"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+/* 令牌和 /shop、/shop/seckill 共用同一个 localStorage 键，所以三个页面之间跳来跳去不用重新登录。 */
+const TOKEN_KEY = "shop_token";
+const USER_KEY = "shop_user";
+
+let token = localStorage.getItem(TOKEN_KEY) || "";
+let username = localStorage.getItem(USER_KEY) || "";
+let catalog = null;        /* /shop/data 的最新结果：商品 + 规格 + 秒杀专场 */
+let cartItems = [];        /* /cart/items 的最新结果 */
+let cartError = "";
+let checkoutOpen = false;  /* 结算面板展开了没有 */
+let orderResult = null;    /* 结算成功后拿到的订单；它不为空时，页面切成「订单详情」 */
+let lastSubmit = null;     /* 点「提交订单」那一刻的购物车快照，订单详情里还要显示 */
+let busy = false;
+
+/* ---------------- 小工具 ---------------- */
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function money(v) { return "¥" + Number(v || 0).toFixed(2); }
+
+async function api(path, options) {
+  const opts = options || {};
+  const headers = {};
+  if (opts.body) headers["Content-Type"] = "application/json";
+  if (opts.auth && token) headers.Authorization = "Bearer " + token;
+
+  const res = await fetch(path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* 有的响应没有 body */ }
+  return { status: res.status, ok: res.ok, data: data };
+}
+
+function flash(text, ok) {
+  const box = $("flash");
+  box.className = "msg " + (ok ? "ok" : "err");
+  box.textContent = text || "";
+}
+
+/* ============================================================
+   留给你实现的部分（1/2）
+   ============================================================ */
+
+/* TODO(你来实现)：按 sku_id 找到「它是哪个商品、什么规格、卖多少钱」。
+   为什么需要它：购物车的 cart_items 表只存了 sku_id 和数量，没有商品名和价格，
+   所以页面得自己从 /shop/data 里把这两样查出来。
+
+   输入：skuID —— 一个数字，比如 16
+   输出：{ product: 商品对象, sku: 规格对象 }；查不到就返回 null
+
+   提示：catalog.products 是个数组，每一项长这样：
+        { id: 13, name: "演示手表 · 星河 Watch", price: 999,
+          skus: [ { id: 14, spec: "46mm 黑色", price: 999 }, ... ] }
+   两层循环就能查出来（商品总共十几个，这个页面也没有每秒刷新的压力）。
+
+   为什么不让后端一次把名字拼好：和「我的秒杀订单」里 productNameOfItem 一个道理 ——
+   页面本来就要拉 /shop/data，手上已经有这份数据了，让服务端再回查一遍数据库是白花一次查询。
+   商品被删掉时会查不到，返回 null，渲染那里会显示一行提示，不影响页面其他部分。 */
+function findSKU(skuID) {
+  return null;
+}
+
+/* TODO(你来实现)：算出购物车合计金额，单位是元。
+   输入：全局变量 cartItems，形如 [ { id: 3, sku_id: 16, quantity: 3 }, ... ]
+   输出：一个数字，比如 447
+
+   提示：每一行的小计 = 那个 SKU 的单价 × 这一行的数量；把每一行加起来就是合计。
+        单价用上面的 findSKU() 拿；查不到的行按 0 算。
+   想一想：金额是浮点数，前端算出来的只用来「显示」。真正的对账要以服务端为准 ——
+        而本项目 orders 表里根本没有金额列，这是个可以直接跟面试官说的简化。 */
+function cartTotal() {
+  return 0;
+}
+
+/* TODO(你来实现)：结算的核心动作 —— 把购物车里的东西提交成一张订单。
+   调的是 POST /orders，也就是「普通下单」接口（不是秒杀那套）。
+
+   要做的四件事：
+     1. 生成 request_id。用 "cart-" + Date.now() 就够，它必须每单唯一。
+        为什么要它：服务端拿它做幂等键。同一次提交重复发出去（网络抖动重试、用户连点两下）
+        只会产生一笔订单，不会重复扣库存。
+     2. 把 cartItems 转成接口要的格式：
+            const items = cartItems.map((it) => ({ sku_id: it.sku_id, quantity: it.quantity }));
+     3. 发请求：
+            const r = await api("/orders", { method: "POST", auth: true,
+                                             body: { request_id: rid, items: items } });
+     4. 成功了（r.ok 为 true）：把 r.data.order 存进全局变量 orderResult，
+        再把购物车清空（checkoutOpen = false，然后 refreshCart()）。
+        失败了：flash("下单失败：HTTP " + r.status + " " + (r.data.error || ""), false)。
+        库存不足就会走到这里 —— 服务端扣库存失败，整个事务回滚，一笔订单都不会留下。
+
+   顺便体会一下：这个接口返回的 order.id 是数据库当场生成的真实订单号。
+   秒杀那边完全相反 —— 抢购接口先返回 id=0，要等 Kafka 消费者落库之后才查得到。
+   原因就是这里走的是同步事务，而秒杀把落库这一步丢给了消息队列。 */
+async function placeOrder() {
+}
+
+/* TODO(你来实现)：模拟支付。
+   调 POST /orders/:id/pay，把订单状态从 pending 改成 paid。
+
+   提示：调用 api 时路径是 "/orders/" + orderID + "/pay"，方法 "POST"，要带 auth: true。
+        成功后把 orderResult.status 改成 "paid"，再 render() 一次。
+        失败就 flash 出服务端的错误信息。
+
+   想一想：真实项目这里会跳去支付渠道、等渠道异步回调，所以「支付」本身也要防重复通知；
+        本项目用一个接口代替，但 order 模块的 Pay 会检查「状态必须是 pending」，
+        重复支付会被拒绝（返回 400「订单状态不允许该操作」）。 */
+async function payOrder(orderID) {
+}
+
+/* ============================================================
+   下面这些已经写好了，你可以直接读，不用改
+   ============================================================ */
+
+/* ---------------- 登录区 ---------------- */
+function renderAccount() {
+  const box = $("account");
+
+  if (token) {
+    box.innerHTML = '<span class="pill ok">已登录 ' + esc(username) + '</span>' +
+                    '<button class="ghost" id="logoutBtn">退出</button>';
+    $("logoutBtn").onclick = logout;
+    return;
+  }
+
+  box.innerHTML = '<input id="accUser" value="demo1" style="width:110px" placeholder="用户名" />' +
+                  '<input id="accPass" type="password" value="demo1234" style="width:110px" placeholder="密码" />' +
+                  '<button id="loginBtn">登录</button>' +
+                  '<button class="ghost" id="toReg">去注册</button>';
+  $("loginBtn").onclick = doLogin;
+  $("toReg").onclick = function () { location.href = "/shop"; };
+}
+
+function setToken(t, name) {
+  token = t;
+  username = name;
+  localStorage.setItem(TOKEN_KEY, t);
+  localStorage.setItem(USER_KEY, name);
+  renderAccount();
+  refreshCart();
+}
+
+function logout() {
+  token = "";
+  username = "";
+  cartItems = [];
+  orderResult = null;
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  renderAccount();
+  render();
+}
+
+async function doLogin() {
+  const name = ($("accUser").value || "").trim();
+  const pass = $("accPass").value || "";
+  if (!name || !pass) { flash("用户名和密码都要填", false); return; }
+
+  try {
+    const r = await api("/login", { method: "POST", body: { username: name, password: pass } });
+    if (!r.ok) { flash("登录失败：HTTP " + r.status + " " + (r.data.error || ""), false); return; }
+    setToken(r.data.token, name);
+    flash("登录成功", true);
+  } catch (e) {
+    flash("登录失败：" + e, false);
+  }
+}
+
+/* ---------------- 拉数据 ---------------- */
+async function refreshCatalog() {
+  try {
+    const res = await fetch("/shop/data");
+    if (!res.ok) return;
+    catalog = await res.json();
+    /* 只在用户没在输入框里打字的时候重绘：不然每 3 秒一刷，会把人家填到一半的数量冲掉。 */
+    if (!isEditing()) render();
+  } catch (e) { /* 轮询失败就静默跳过，下次再试 */ }
+}
+
+function isEditing() {
+  const el = document.activeElement;
+  return !!(el && el.tagName === "INPUT" && el.closest && el.closest("#view"));
+}
+
+async function refreshCart() {
+  if (!token) { cartItems = []; render(); return; }
+
+  try {
+    const r = await api("/cart/items", { auth: true });
+    if (r.status === 401) { logout(); return; }   /* 令牌过期了，退回未登录状态 */
+    if (!r.ok) {
+      cartError = "HTTP " + r.status + " " + (r.data.error || "");
+      render();
+      return;
+    }
+    cartError = "";
+    cartItems = r.data.items || [];
+    render();
+  } catch (e) {
+    cartError = String(e);
+    render();
+  }
+}
+
+/* ---------------- 改数量 / 删除（这两个是简单的接口调用） ---------------- */
+async function saveQty(itemID) {
+  const input = $("qty-" + itemID);
+  const qty = input ? Number(input.value) : 0;
+  if (!qty || qty < 1) { flash("数量必须大于 0", false); return; }
+
+  const r = await api("/cart/items/" + itemID, { method: "PATCH", auth: true, body: { quantity: qty } });
+  if (!r.ok) { flash("保存失败：HTTP " + r.status + " " + (r.data.error || ""), false); return; }
+  flash("数量已更新", true);
+  await refreshCart();
+}
+
+async function removeItem(itemID) {
+  const r = await api("/cart/items/" + itemID, { method: "DELETE", auth: true });
+  if (!r.ok) { flash("删除失败：HTTP " + r.status + " " + (r.data.error || ""), false); return; }
+  flash("已从购物车移除", true);
+  await refreshCart();
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderBanner() {
+  if (!token) {
+    return '<span class="pill warn">未登录</span>' +
+      '<span class="hint" style="margin:0">购物车是私密数据，先在右上角登录。' +
+      '演示账号 <code>demo1</code> / <code>demo1234</code></span>';
+  }
+
+  const pieces = cartItems.reduce(function (a, it) { return a + it.quantity; }, 0);
+  return '<span class="name">🧺 我的购物车</span>' +
+    '<span class="pill ok">已登录 ' + esc(username) + '</span>' +
+    '<span class="pill">' + cartItems.length + ' 种商品 · 共 ' + pieces + ' 件</span>' +
+    '<span class="hint" style="margin:0">这个页面走<b>普通下单</b>：一个 MySQL 事务里扣库存、建订单；' +
+    '秒杀走的是 Redis + Kafka 那条路，对比见页面底部</span>';
+}
+
+function renderCart() {
+  if (!token) {
+    return '<div class="panel"><div class="empty">购物车是私密数据，先在右上角登录。<br />' +
+           '演示账号 <code>demo1</code> / <code>demo1234</code>；还没有账号就去 ' +
+           '<a href="/shop">商品列表页</a> 注册一个。</div></div>';
+  }
+
+  if (cartError) {
+    return '<div class="panel"><p class="msg err" style="margin:0">加载购物车失败：' + esc(cartError) + '</p></div>';
+  }
+
+  if (cartItems.length === 0) {
+    return '<div class="panel"><div class="empty">购物车是空的。<br />' +
+           '去 <a href="/shop">商品列表</a> 打开一个商品，在规格那一行点「加入购物车」。</div></div>';
+  }
+
+  const rows = cartItems.map(function (it) {
+    const found = findSKU(it.sku_id);
+
+    if (!found) {
+      return '<tr><td colspan="6" class="hint" style="margin:0">明细 #' + it.id +
+             '（sku_id=' + it.sku_id + '）没能在 /shop/data 里查到商品 —— ' +
+             '要么商品被删了，要么 findSKU() 还没实现。</td></tr>';
+    }
+
+    const sub = found.sku.price * it.quantity;
+    return '<tr>' +
+      '<td>' + esc(found.product.name) + '</td>' +
+      '<td>' + esc(found.sku.spec) + '</td>' +
+      '<td>' + money(found.sku.price) + '</td>' +
+      '<td><input id="qty-' + it.id + '" type="number" min="1" value="' + it.quantity + '" style="width:78px" /></td>' +
+      '<td>' + money(sub) + '</td>' +
+      '<td class="ops">' +
+        '<button class="ghost" data-save="' + it.id + '">保存数量</button>' +
+        '<button class="ghost" data-del="' + it.id + '">删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+
+  const total = cartTotal();
+  const totalText = total > 0
+    ? '<span class="sum">' + money(total) + '</span>'
+    : '<span class="sum hint" style="margin:0">¥0 —— cartTotal() 还没实现？</span>';
+
+  return '<div class="panel">' +
+    '<h2>购物车明细</h2>' +
+    '<p class="hint">数据来自 <code>GET /cart/items</code>。' +
+    '注意接口只返回 <code>sku_id</code> 和数量 —— 商品名、规格、单价是页面上自己查表拼出来的。</p>' +
+    '<table><tr><th>商品</th><th>规格</th><th>单价</th><th>数量</th><th>小计</th><th>操作</th></tr>' +
+    rows + '</table>' +
+    '<div class="totals">' +
+      '<span class="hint" style="margin:0">共 ' + cartItems.length + ' 种商品</span>' +
+      '合计&nbsp;' + totalText +
+      '<span style="flex:1"></span>' +
+      '<button id="checkoutBtn">去结算</button>' +
+    '</div>' +
+  '</div>' +
+  (checkoutOpen ? renderCheckout() : '');
+}
+
+function renderCheckout() {
+  const total = cartTotal();
+
+  return '<div class="panel">' +
+    '<h2>结算</h2>' +
+    '<p class="hint">下面这几格收货信息<b>不会发给后端</b>：本项目没有地址表、不做物流，' +
+    '它们只是让你看清结算页长什么样。真正发出去的只有商品清单。</p>' +
+    '<div class="form">' +
+      '<input id="buyer" value="' + esc(username) + '" placeholder="收货人" style="width:150px" />' +
+      '<input id="addr" value="演示市演示路 1 号" placeholder="收货地址" style="width:280px" />' +
+      '<input id="phone" value="13800000000" placeholder="手机号" style="width:150px" />' +
+    '</div>' +
+    '<p class="hint" style="margin:14px 0 0">商品 ' + cartItems.length + ' 种 · 应付 ' + money(total) + '</p>' +
+    '<div class="actions">' +
+      '<button id="placeBtn">提交订单</button>' +
+      '<button class="ghost" id="backBtn">返回购物车</button>' +
+    '</div>' +
+    '<p class="hint" style="margin:12px 0 0">点「提交订单」会调 <code>POST /orders</code>：' +
+    '它在<b>一个 MySQL 事务</b>里扣库存 + 建订单 + 写明细，中间任何一步失败就整体回滚。' +
+    '这是和秒杀最本质的区别 —— 秒杀不在数据库里排队，先在 Redis 扣、再丢进 Kafka 慢慢落库。</p>' +
+  '</div>';
+}
+
+function renderOrderResult() {
+  const o = orderResult;
+  const paid = o.status === "paid";
+  const snap = lastSubmit || { items: [], total: 0 };
+
+  const rows = snap.items.map(function (it) {
+    const found = findSKU(it.sku_id);
+    const name = found ? found.product.name : ("SKU #" + it.sku_id);
+    const spec = found ? found.sku.spec : "-";
+    const price = found ? money(found.sku.price) : "-";
+    return '<tr><td>' + esc(name) + '</td><td>' + esc(spec) + '</td><td>' + it.quantity + '</td><td>' + price + '</td></tr>';
+  }).join('');
+
+  return '<div class="panel">' +
+    '<h2>' + (paid ? '✅ 支付完成' : '🧾 订单已创建，等待支付') + '</h2>' +
+    '<p class="hint">订单号 <b>#' + o.id + '</b> · 状态 <b>' + esc(o.status) + '</b> · ' +
+    '下单时间 ' + esc(o.created_at) + '<br />' +
+    'request_id <code>' + esc(o.request_id) + '</code>（服务端靠它做幂等：同一个 request_id 重复提交只会有一笔订单）</p>' +
+    '<table><tr><th>商品</th><th>规格</th><th>数量</th><th>单价</th></tr>' +
+    (rows || '<tr><td colspan="4" class="hint" style="margin:0">这一单没有明细</td></tr>') + '</table>' +
+    '<div class="totals">' +
+      '合计&nbsp;<span class="sum">' + money(snap.total) + '</span>' +
+      '<span style="flex:1"></span>' +
+      (paid ? '' : '<button id="payBtn">模拟支付</button>') +
+      '<a class="btn ghost" href="/shop">继续购物</a>' +
+    '</div>' +
+    '<p class="hint" style="margin:12px 0 0">注意这个订单号是<b>数据库当场生成</b>的真实 ID。' +
+    '对比一下秒杀：那边抢购接口先返回 <code>id=0</code>，要等 Kafka 消费者把订单写进 MySQL 之后才查得到 —— ' +
+    '同步事务和异步落库的区别，一眼就看出来了。<br />' +
+    '另外 <code>orders</code> 表里没有金额列，金额只是页面算给你看的：真要对账，' +
+    '得靠订单明细里的 SKU 和数量去乘当时的售价。</p>' +
+  '</div>';
+}
+
+/* 这份清单列出的就是「留给你实现的部分」。填完一个，刷新页面再看效果。 */
+const BLANKS = [
+  ["findSKU(skuID)", "internal/shop/web/cart.html",
+   "把明细里的 sku_id 换成商品名 / 规格 / 单价 —— 从 /shop/data 里查表。"],
+  ["cartTotal()", "internal/shop/web/cart.html",
+   "把每一行的小计（单价 × 数量）加起来，得到合计金额。"],
+  ["addToCart(skuID, quantity)", "internal/shop/web/index.html",
+   "商品详情页点「加入购物车」：POST /cart/items。"],
+  ["placeOrder()", "internal/shop/web/cart.html",
+   "结算：生成 request_id → POST /orders → 成功后清空购物车、切到订单详情。"],
+  ["payOrder(orderID)", "internal/shop/web/cart.html",
+   "模拟支付：POST /orders/:id/pay，成功后把状态改成 paid。"],
+  ["购物车明细的归属校验", "internal/cart/service.go",
+   "修越权：UpdateQuantity / RemoveItem 现在只看明细 id，不看这条明细属于谁。"]
+];
+
+function renderBlanks() {
+  if (document.body.dataset.hideBlanks === "1") return "";
+
+  const rows = BLANKS.map(function (b) {
+    return '<tr><td><code>' + esc(b[0]) + '</code></td><td><code>' + esc(b[1]) + '</code></td><td>' + esc(b[2]) + '</td></tr>';
+  }).join('');
+
+  return '<div class="panel">' +
+    '<h2>留给你实现的部分</h2>' +
+    '<p class="hint">这几个函数体里写着 <code>TODO(你来实现)</code>。填完刷新页面就能看到效果；' +
+    '在这之前，页面不会崩，只是对应的那一步没反应（金额显示 0、点提交没动静）。</p>' +
+    '<table><tr><th>函数 / 位置</th><th>文件</th><th>要做什么</th></tr>' + rows + '</table>' +
+  '</div>';
+}
+
+function render() {
+  $("banner").innerHTML = renderBanner();
+  $("view").innerHTML = (orderResult ? renderOrderResult() : renderCart()) + renderBlanks() + renderWhy();
+  bind();
+}
+
+/* 这一块是给面试讲的话术，不是代码练习。 */
+function renderWhy() {
+  return '<div class="panel">' +
+    '<h2>同一个「下单」，为什么有两套做法</h2>' +
+    '<p class="hint" style="margin:0 0 8px">' +
+    '购物车结算走的是 <b>同步事务</b>：<code>POST /orders</code> 在一个 MySQL 事务里' +
+    '把库存扣掉、订单和明细一起写进去。它简单、强一致 —— 失败就回滚，不会有中间状态。' +
+    '代价是每一步都要等数据库，一秒能处理的订单量就那么多。</p>' +
+    '<p class="hint" style="margin:0 0 8px">' +
+    '秒杀走的是 <b>Redis 预扣 + Kafka 削峰 + 异步落库</b>：请求进来先在 Redis 里' +
+    '用一段 Lua 脚本原子地判断库存和限购、扣掉库存，然后往 Kafka 丢一条消息就立刻返回。' +
+    '用户看到「排队中」，数据库慢慢按自己的节奏消费。它能顶住上万 QPS，' +
+    '代价是「最终一致」—— 中间那一小段时间，Redis 和 MySQL 的数字是对不上的，' +
+    '所以才需要超时关单、对账、补偿这一整套兜底。</p>' +
+    '<p class="hint" style="margin:0">' +
+    '面试时这么讲最省事：<b>「普通的购物车结算是同步强一致，秒杀是异步最终一致，' +
+    '两条路我都在这个项目里实现了，也都能跑通。」</b> 然后指着页面说：' +
+    '「这个订单号是数据库当场给我的，而秒杀那边我拿到的是 id=0。」</p>' +
+  '</div>';
+}
+
+/* ---------------- 事件绑定 ---------------- */
+function bind() {
+  document.querySelectorAll("[data-save]").forEach(function (btn) {
+    btn.onclick = function () { saveQty(Number(btn.dataset.save)); };
+  });
+  document.querySelectorAll("[data-del]").forEach(function (btn) {
+    btn.onclick = function () { removeItem(Number(btn.dataset.del)); };
+  });
+
+  const ck = $("checkoutBtn");
+  if (ck) ck.onclick = function () { checkoutOpen = true; render(); };
+
+  const back = $("backBtn");
+  if (back) back.onclick = function () { checkoutOpen = false; render(); };
+
+  const place = $("placeBtn");
+  if (place) place.onclick = async function () {
+    if (busy) return;
+    busy = true;
+    place.disabled = true;
+
+    /* 先把「提交前」的购物车拍个快照：提交成功后购物车会被清空，
+       但订单详情里还要把这一单买了什么、多少钱显示出来。 */
+    lastSubmit = { items: cartItems.slice(), total: cartTotal() };
+
+    const before = orderResult;
+    try {
+      await placeOrder();
+      if (orderResult === before) flash("placeOrder() 还没实现 —— 见下面「留给你实现的部分」。", false);
+    } catch (e) {
+      flash("提交失败：" + e, false);
+    } finally {
+      busy = false;
+      if ($("placeBtn")) $("placeBtn").disabled = false;
+    }
+  };
+
+  const pay = $("payBtn");
+  if (pay) pay.onclick = async function () {
+    const before = orderResult && orderResult.status;
+    try {
+      await payOrder(orderResult.id);
+      if (orderResult && orderResult.status === before) {
+        flash("payOrder() 还没实现 —— 见下面「留给你实现的部分」。", false);
+      }
+    } catch (e) {
+      flash("支付失败：" + e, false);
+    }
+  };
+}
+
+/* ---------------- 启动 ---------------- */
+renderAccount();
+render();
+refreshCatalog();
+refreshCart();
+setInterval(refreshCatalog, 3000);
+</script>
+</body>
+</html>

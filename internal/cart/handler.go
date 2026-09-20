@@ -59,7 +59,11 @@ func (h *Handler) List(c *gin.Context) {
 }
 
 // UpdateQuantity 处理 PATCH /cart/items/:item_id。
+// userID 必须从令牌里取（c.GetUint），不能信请求体里传的任何「用户标识」——
+// 那是攻击者随手就能改的东西。
 func (h *Handler) UpdateQuantity(c *gin.Context) {
+	userID := c.GetUint(contextUserID)
+
 	itemID, err := strconv.ParseUint(c.Param("item_id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "明细 ID 格式错误"})
@@ -72,7 +76,7 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 		return
 	}
 
-	if err := h.service.UpdateQuantity(uint(itemID), req.Quantity); err != nil {
+	if err := h.service.UpdateQuantity(userID, uint(itemID), req.Quantity); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -82,13 +86,15 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 
 // RemoveItem 处理 DELETE /cart/items/:item_id。
 func (h *Handler) RemoveItem(c *gin.Context) {
+	userID := c.GetUint(contextUserID)
+
 	itemID, err := strconv.ParseUint(c.Param("item_id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "明细 ID 格式错误"})
 		return
 	}
 
-	if err := h.service.RemoveItem(uint(itemID)); err != nil {
+	if err := h.service.RemoveItem(userID, uint(itemID)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

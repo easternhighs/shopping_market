@@ -14,8 +14,13 @@
 //
 //	GET /shop          商品列表页（静态 HTML，用 go:embed 打进二进制）
 //	GET /shop/seckill  秒杀独立页（静态 HTML）
+//	GET /shop/cart     购物车与结算页（静态 HTML）
 //	GET /shop/data     只读数据接口：商品 + SKU + 当前秒杀专场 + Redis 剩余库存
 //	GET /shop/my       当前登录用户的秒杀订单（需要 JWT）
+//
+// 购物车页和另外两个页面有个区别：它自己不带任何服务端数据，页面打开后由浏览器
+// 直接去调 cart / order 两个模块已经注册好的接口（/cart/items、/orders）。
+// 前台在这里只负责「把页面发出去」，不参与业务——这样购物车怎么改都不用动 shop 包。
 //
 // 为什么秒杀要单独一个页面：真实电商的秒杀页通常独立部署、独立扩容，
 // 因为它要扛瞬时的高流量，和「商品详情」这种读多写少的页面根本不是一个量级。
@@ -39,14 +44,17 @@ import (
 // 反复点 /demo 的「一键准备」会不断建新活动，不限量的话页面会被历史数据淹掉。
 const activityLimit = 5
 
-// indexPage 是商品列表页，seckillPage 是秒杀独立页。
-// 两个都用 go:embed 打进可执行文件，部署时只要一个二进制，不用再单独拷 web 目录。
+// indexPage 是商品列表页，seckillPage 是秒杀独立页，cartPage 是购物车与结算页。
+// 三个都用 go:embed 打进可执行文件，部署时只要一个二进制，不用再单独拷 web 目录。
 //
 //go:embed web/index.html
 var indexPage []byte
 
 //go:embed web/seckill.html
 var seckillPage []byte
+
+//go:embed web/cart.html
+var cartPage []byte
 
 // contextUserID 必须和 user 模块鉴权中间件写进上下文的键一致（都是 "userID"）。
 const contextUserID = "userID"
@@ -128,6 +136,15 @@ func (h *Handler) Page(c *gin.Context) {
 // 具体抢哪个商品由页面自己从 query（?item=24）里读，服务端不做任何预处理。
 func (h *Handler) SeckillPage(c *gin.Context) {
 	c.Data(http.StatusOK, "text/html; charset=utf-8", seckillPage)
+}
+
+// CartPage 处理 GET /shop/cart，吐出购物车与结算页。
+//
+// 为什么这个页面不需要登录也能打开：页面本身只是一张「壳」，登录判断和取数都在
+// 浏览器里做（和 /shop 一样）。真正私密的是 /cart/items 那些接口，它们都在
+// 鉴权中间件后面——页面可以公开，数据不行，这个分界别搞混。
+func (h *Handler) CartPage(c *gin.Context) {
+	c.Data(http.StatusOK, "text/html; charset=utf-8", cartPage)
 }
 
 // Data 处理 GET /shop/data，返回前台页面需要的全部只读数据。
