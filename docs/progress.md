@@ -4,8 +4,22 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 12 已完成**（购物车与结算页）。5 个前端函数与购物车越权校验已全部填完并实跑验证：`/shop/cart` 能从购物车一路点到「提交订单 → 支付成功」，`demo2` 改 / 删 `demo1` 的购物车明细一律 404。往后是可选收尾项（订单侧越权、部署说明、按需拆微服务），也可以按你的面试重点直接换方向
-- 本次完成：**阶段 12 收口：把 5 个前端函数和 1 处越权校验全部填完，普通下单链路现场可点、越权被挡住**（阶段 12 完成）
+- 当前阶段：**阶段 13 进行中**（网关收口）。微服务设计讨论稿已写完，网关与 trace 的**骨架已落地**（`internal/gateway` + `internal/pkg/trace` + `cmd/gateway` + `make run-gateway`），按挖空规则留了 **6 处空**等你填。填完照着 `docs/build.md` 阶段 13 的六步验证流程走一遍就能收口。骨架现状：`gofmt` / `go vet` / `go build` 干净，`GET /healthz` 能通，其余 5 步要等空填完
+- 本次完成：**阶段 13 起步：写完微服务拆分讨论稿，并搭好「网关 + trace id」骨架（留 6 处空）**（阶段 13 进行中）
+  - 要解决的问题：前 12 个阶段功能和压测都做完了，但有一问一直没答上——「万一要拆微服务，你从哪儿下手？」。这一轮先把**设计想清楚**（写成文档），再把微服务的**第一块砖（网关）**立起来：网关负责四件事——哪个路径归哪个服务、谁需要登录、这次请求的编号是什么、请求转给谁。这四件事想明白了，以后把某个模块搬成独立进程就只是「换个上游地址」
+  - 文档产出：新增 `docs/microservices.md`（272 行，讨论稿，不写代码只写决策）。内容包括：① 现状体检——9 个业务包、跨包依赖只有 4 条（`order→inventory`、`payment→order`、`shop→product,seckill`、`demo→user,product,inventory,seckill`）；② **关键发现：秒杀自带一套库存池**（`seckill_items.total_stock/sold` 独立于 `stocks` 表，秒杀链路全程不碰 `inventory.stocks`），所以秒杀模块数据自治、是最好拆的一块；③ 三处硬耦合（`internal/order/service.go:67` 那个共用的 `DeductWithDB(tx,...)`、`internal/demo/handler.go:76` 的 `/demo/seed` 一次写四类表、`internal/shop` 在服务端拼 product+seckill）；④ 目标拓扑（gateway / user / product+inventory / order+cart+payment / seckill 五块，各自独占哪些表）；⑤ **拆分必须补的 5 件事**（鉴权下沉到网关、秒杀热路径一跳都不能加、下单扣库存改成「RPC + 本地消息表 + 重试」并明确否决 2PC/TCC/Seata、幂等与跨服务对账、trace id 全程透传）；⑥ 阶段 13~17 的落地路线；⑦ 代价对照表（**特别写明：同机跑多进程会互抢 CPU，微服务 QPS 通常反而比单体低，要证明收益必须跑多机**）
+  - 代码骨架（都是新文件，**没有动任何现有业务代码**）：
+    - `internal/pkg/trace/trace.go`：请求编号工具。header 名 `X-Trace-Id`、`WithID` / `FromContext` / `FromGin` 已写好，**留 2 个空**（`NewID`、`Middleware`）
+    - `internal/gateway/doc.go`：包注释，讲清网关管哪四件事、为什么做成「旁路式」
+    - `internal/gateway/route.go`：路由表（12 条路径前缀 → 6 个服务 `user`/`product`/`order`/`seckill`/`shop`/`console`）、公开白名单 `PublicPaths`、藏在公开前缀下的私有名单 `ProtectedPaths`（`/shop/my`）、读 `GATEWAY_UPSTREAM_<服务名大写>` 的 `ServiceUpstream`；**留 2 个空**（`MatchRoute` 最长前缀匹配、`IsPublic` 判断顺序）
+    - `internal/gateway/auth.go`：网关统一验 JWT，验过就把用户 id 塞进 `X-User-Id` 请求头给下游（下游信任这个头，所以下游**不能暴露公网**）；**留 1 个空**（`Auth` 五步）
+    - `internal/gateway/proxy.go`：反向代理。`hopByHopHeaders`、`Proxy` 结构、`NewProxy`（一个服务复用一个 `ReverseProxy`，复用连接池）、`Handler()`（匹配路由 → 转发，未命中 404、上游挂了 502）、`ErrorHandler`（502 + trace id + 一行日志）都已写好；**留 1 个空**（`proxy.Director` 改写请求四步）
+    - `cmd/gateway/main.go`：网关入口，与 `cmd/server/main.go` 同款结构（`envOr` 读环境变量、`gin.New()+Recovery`、中间件顺序 **trace → accessLog → Auth**、自带 `GET /healthz` 返回服务/上游映射、防御性超时、优雅退出）。环境变量：`GATEWAY_ADDR`（默认 `:8081`）、`GATEWAY_BACKEND`（默认 `http://127.0.0.1:8080`）、`GATEWAY_UPSTREAM_<服务名大写>`
+    - `Makefile`：新增 `make run-gateway` / `make build-gateway`
+  - 为什么做成「旁路」：网关是**新端口 8081**、转发给现在这个单体 8080，`cmd/server/main.go` 一个字都不改。这样零回归风险（原来怎么压测还怎么压测）、出问题不启动网关就回退了、还能拿「直连 8080 vs 走 8081」做一次干净的性能对照
+  - 骨架实测（已跑通，证明脚手架可用）：`gofmt -l cmd internal` 无输出、`go vet ./...` / `go build ./...` 通过；网关起来后 `GET /healthz` 返回 **200**，打出「监听 :8081，默认上游 http://127.0.0.1:8080」和 6 行服务映射；`GET /shop`、`POST /login` 返回 **404「网关没有为这个路径配置上游服务」**（空 3 还没填的表现）、`trace_id` 是空串且响应头没有 `X-Trace-Id`（空 1 + 空 2 还没填的表现）——**这些都是「挖空」的正常状态，不是 bug**
+  - 明确没做的事：不动 `cmd/server/main.go`（避免污染压测过的热路径）、不拆任何业务模块（那是阶段 14 以后的事）、不引入服务发现 / 配置中心
+- 上一轮完成：**阶段 12 收口：把 5 个前端函数和 1 处越权校验全部填完，普通下单链路现场可点、越权被挡住**（阶段 12 完成）
   - 要解决的问题：上一轮把页面骨架和「空」都摆好了，但结算按钮点了没反应、`demo2` 还能改删 `demo1` 的购物车明细。这两件事不解决，阶段 12 就只是一张假页面
   - 填完 5 个前端函数：`cart.html` 的 `findSKU(skuID)`（拿 SKU 号在 `GET /shop/data` 的目录里两层循环查表，命中返回 `{product, sku}`、否则 `null`）、`cartTotal()`（`reduce` 把每行「单价 × 数量」累加成合计，查不到的 SKU 按 0 算）、`placeOrder()`（拼 `request_id = "cart-" + 时间戳`，把购物车明细映射成 `[{sku_id, quantity}]` 调 `POST /orders`，成功后把订单对象存进 `orderResult` 并切到订单详情）、`payOrder(orderID)`（调 `POST /orders/:id/pay`，成功后把订单状态改成 `paid` 并重绘）；`index.html` 的 `addToCart(skuID)`（未登录 / 数量小于 1 先拦，否则 `POST /cart/items`）
   - 填完越权校验（IDOR）：`internal/cart/service.go` 的 `UpdateQuantity` / `RemoveItem` 先调仓储层的 `FindItemByIDForUser(itemID, userID)` —— 这条 SQL 把 `user_id` 写进 `WHERE`，查不到就返回 `ErrItemNotOwned`，Service 直接返回、不再往下执行改 / 删；`internal/cart/handler.go` 把 `ErrItemNotOwned` 映射成 **404「购物车明细不存在」**
@@ -118,7 +132,7 @@
   - 实测：256 VU 压 20 秒，系统自己打出「`15:40:05` 突发流量（QPS 4705/s、门槛 500/s）」和「`15:40:27` 恢复（持续 22 秒、峰值 5257.7）」；5xx 峰值 0%、Kafka LAG 峰值 0、在途订单峰值 0；同一条件 A/B（观测前 112,631 请求 / p99 60.0ms，观测后 108,353 请求 / p99 65.18ms），**QPS 无可见下降**
   - 顺手修掉四个真实缺陷（都写进 `docs/interview.md` 了，是很好的面试素材）：① 告警文案和判据不一致（冷启动基线为 0 时报「越过门槛 0/s」）；② 4xx 拒绝率算出 100.43%（分子是「请求结束」、分母是「请求进来」，改了分母口径）；③ 恢复事件的峰值报的是最后一个窗口的瞬时值（586）而不是真实峰值（5257）；④ 报告里事件顺序倒置
 - 上一轮文档产出：`docs/benchmark.md` 新增「优化记录 8」（改动表、返回值约定、三个取舍、A/B 对比、CPU profile 结论、一致性复核、已知小风险）；`docs/architecture.md` 更新秒杀时序图（4 次往返 → 1 次 Lua）、三层防线、Redis Key 表（新增 `:window`、限流 key 改按用户）、pprof 开关、第 10 节瓶颈结论；`docs/interview.md` 新增「第 ⑤ 轮优化故事」、数据手册补新数据、重写 Q6（QPS 怎么冲上去的）和 Q8（限流为什么搬进 Lua）、更新不足清单；`docs/build.md` 的 6.1 标记完成并补实测结论
-- 下一步计划：**代码、演练、资料三块都齐了**，往后只剩「超纲项」和「可选项」：① `docs/reports/` 里目前只有一份阶段 6.3 的样例报告，想让资料更新一版的话，跑一次 `k6 run --summary-export .tmp/k6_summary.json ... scripts/k6_bench.js` 再用 `go run ./cmd/benchreport` 生成即可；② `docs/interview.md` 不足清单里剩下的都是超出单机项目范围的项（部署层面、接 Prometheus / OpenTelemetry、接模拟支付渠道）；③ 如果面试方向偏前端，可以再补购物车 / 结算页（接口都有，纯前端工作量）
+- 下一步计划：**把阶段 13 的 6 个空填完并收口**（填 `internal/pkg/trace/trace.go` 的 `NewID`/`Middleware`、`internal/gateway/route.go` 的 `MatchRoute`/`IsPublic`、`internal/gateway/auth.go` 的 `Auth`、`internal/gateway/proxy.go` 的 `proxy.Director`），然后照 `docs/build.md` 阶段 13 的六步验证流程实跑一遍（`/healthz` → 未登录访问 `/me` 应 401 → `/login` 拿 token → 带 token 走 `/me` `/cart/items` `/shop` → 看 `X-Trace-Id` 响应头与访问日志 → 把 `GATEWAY_BACKEND` 指到错误端口看 502）。收口之后如果还想继续拆，下一步是**阶段 14：把 `internal/user` 拆成独立进程**，用 `GATEWAY_UPSTREAM_USER` 一个环境变量把 `/login` `/register` `/me` 挪过去
 - 更早两轮的结论（备查）：优化记录 6 用 k6 对照定位出「Gin 自带的逐请求访问日志」是第一个天花板（写文件 6,500/s vs 丢弃 55,000/s，差 9 倍），并用隔离基准量出「一次抢购 4 次 Redis 往返」的上限约 9,000/s；优化记录 7 在不动链路结构的前提下把峰值做到 5,907 QPS，并修掉对账超卖隐患
 ## 阶段进度
 
@@ -135,3 +149,4 @@
 - [x] 阶段 10：滑动窗口限流（ZSET 记放行时刻，抢购热路径与秒杀管理接口两处都改，A/B 实测证明边界放水消失）
 - [x] 阶段 11：面试演练与资料收口（k6 脚本进版本库、附录 A/B 补上超时关单与滑动窗口、照着脚本实跑验证）
 - [x] 阶段 12：购物车与结算页（/shop/cart 页面 + 商品页加购列；5 个前端函数与购物车越权校验均已实现并实测）
+- [ ] 阶段 13：网关收口（微服务讨论稿已写完；网关 + trace 骨架已落地，12 条路由 / 6 个服务，**6 处空待填**）

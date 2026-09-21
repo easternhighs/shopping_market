@@ -723,6 +723,88 @@ shopping_market/
   - 重复支付被拒：`POST /orders/11/pay` 第二次返回 400「订单状态不允许该操作」。
 - 完成标志：上面这些用例全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。**已达成。**
 
+### 阶段 13：网关收口（骨架已就绪，留 6 处空待填）
+
+- 为什么做这一章：前 12 个阶段把功能和压测都做完了，但一直有一个问题没回答——
+  「**万一将来要拆微服务，你从哪儿下手？**」。这一章的答案是：先把**网关**立起来。
+  网关是微服务的第一块砖：它管「哪个路径归哪个服务」「谁需要登录」「这次请求的编号是什么」「请求转给谁」，
+  这四件事想清楚了，后面把某个模块搬成独立进程就只是「换个上游地址」而已。
+  完整的设计讨论（现状体检、三处硬耦合、目标形态、落地路线、代价对照）写在 `docs/microservices.md`。
+- 这一章的关键词是「**旁路**」：网关是一个**新端口（默认 8081）**，
+  它把请求转发给现在这个单体（默认 `http://127.0.0.1:8080`）。
+  **`cmd/server/main.go` 一个字都不改**，秒杀热路径、压测脚本、演示页面全部照旧。
+  这样做有三个好处：① 零回归风险，原来怎么压测还怎么压测；
+  ② 出问题直接不启动网关就回退了；③ 可以拿「直连 8080」和「走 8081」做一次干净的性能对照。
+- 这一章刻意不做的事：不动 `cmd/server`、不拆任何业务模块（真正的拆分是阶段 14 以后的事）、
+  不引入服务发现和配置中心（服务数量是固定的，环境变量足够）。
+
+- 新增的文件：
+
+  | 文件 | 作用 | 状态 |
+  | --- | --- | --- |
+  | `internal/pkg/trace/trace.go` | 请求编号（trace id）：生成、塞进上下文、读写 HTTP 头 | 2 处空 |
+  | `internal/gateway/doc.go` | 包注释：网关管哪四件事、为什么做成旁路 | 完整 |
+  | `internal/gateway/route.go` | 路由表（12 条路径前缀 → 6 个服务）、白名单、最长前缀匹配 | 2 处空 |
+  | `internal/gateway/auth.go` | 网关统一验 JWT，把用户 id 塞进 `X-User-Id` 头给下游 | 1 处空 |
+  | `internal/gateway/proxy.go` | 反向代理：按路由表把请求转给对应服务的上游地址 | 1 处空 |
+  | `cmd/gateway/main.go` | 网关进程入口（`GATEWAY_ADDR` / `GATEWAY_BACKEND` / `GET /healthz`） | 完整 |
+  | `Makefile` | 新增 `make run-gateway` / `make build-gateway` | 完整 |
+
+- **留给你填的 6 个空**（每个空的上方都有一段注释讲清思路和坑）：
+
+  | # | 文件 | 函数 | 要做什么 |
+  | --- | --- | --- | --- |
+  | 1 | `internal/pkg/trace/trace.go` | `NewID()` | 生成一个随机唯一串：`crypto/rand` 取 16 字节 → 十六进制编码；取随机数失败时退回「时间戳 + 随机数」，**不要 panic** |
+  | 2 | `internal/pkg/trace/trace.go` | `Middleware()` | 四步：沿用请求头里的编号或新生成 → 存进 gin 上下文和请求 Context → 写回响应头 → `c.Next()` |
+  | 3 | `internal/gateway/route.go` | `MatchRoute(path)` | 遍历 `Routes` 做**最长前缀匹配**，返回命中的路由；一条都没命中返回 `false` |
+  | 4 | `internal/gateway/route.go` | `IsPublic(path)` | 先查 `ProtectedPaths`（命中返回 false）再查 `PublicPaths`（命中返回 true），两边都没有默认 false |
+  | 5 | `internal/gateway/auth.go` | `Auth()` | 五步：白名单放行 → 取 `Authorization: Bearer <token>` → `jwt.Parse` 验签 → 把用户 id 写进 `X-User-Id` 请求头 → `c.Next()`；失败必须 `c.Abort()` |
+  | 6 | `internal/gateway/proxy.go` | `proxy.Director` | 四步：改 `Scheme` / `Host` / `req.Host`（**不动 Path 和 Query**）→ 删 hop-by-hop 头 → 透传 trace id → 不覆盖已有的 `X-User-Id` |
+
+  其中第 3、4 个空最容易写错，注释里专门解释了为什么：
+  - 第 3 个：**不能「命中就返回」**。必须记住目前命中的最长前缀。
+    否则将来加了 `/products` 和 `/products/export` 两条，`/products/export/1` 归谁管就取决于「表里谁先写」——
+    这种 bug 换个顺序就复现或消失，非常难查。
+  - 第 4 个：**顺序不能反**。`/shop` 是公开前缀，但 `/shop/my`（我的订单）是私有的，
+    所以必须**先**查私有名单。反过来的话 `/shop/my` 会先命中 `/shop` 被放行，等于把别人的订单列表公开了。
+
+- 启动方式：
+
+  ```powershell
+  # 1) 先把原来的单体服务跑起来（网关是转发给它的）
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  go run ./cmd/server
+  # 2) 另开一个窗口，起网关
+  make run-gateway        # 等价于 go run ./cmd/gateway
+  ```
+
+  | 环境变量 | 默认值 | 说明 |
+  | --- | --- | --- |
+  | `GATEWAY_ADDR` | `:8081` | 网关监听地址 |
+  | `GATEWAY_BACKEND` | `http://127.0.0.1:8080` | 默认上游（也就是现在这个单体） |
+  | `GATEWAY_UPSTREAM_<服务名大写>` | 空 | 给某个服务单独指定上游，例如 `GATEWAY_UPSTREAM_USER=http://127.0.0.1:8082`（阶段 14 拆 user 时就用它） |
+
+- 六步验证流程（填完空之后按顺序走一遍）：
+
+  1. **健康检查**：浏览器或 curl 打开 `http://127.0.0.1:8081/healthz`，应该返回 `200`，
+     内容里有 `status: "ok"` 和一张「6 个服务 → 上游地址」的映射表。
+  2. **未登录被拦**：不带 token 访问 `http://127.0.0.1:8081/me`，应该返回 **401**（而不是 404）。
+     回 404 说明空 3（`MatchRoute`）还没填对，请求根本没走到鉴权。
+  3. **登录拿 token**：`POST http://127.0.0.1:8081/login`，body 是 `{"username":"demo1","password":"demo1234"}`，
+     从返回的 JSON 里取顶层的 `token` 字段（注意：接口返回是扁平的，**没有** `data` 包裹）。
+  4. **带 token 走网关访问**：`/me`、`/cart/items`、`/shop` 都应该正常返回。
+     这一步能过，说明路由、鉴权、转发三件事都对了。
+  5. **看 trace id**：随便挑一次请求，看**响应头里的 `X-Trace-Id`**，再对照网关控制台的访问日志，
+     两处应该是同一个编号；`/healthz` 的返回体里也会带上本次请求的 `trace_id`。
+     如果响应头里没有这个字段、或者值是空串，说明空 1 / 空 2 还没填。
+  6. **看 502 兜底**：把 `GATEWAY_BACKEND` 指到一个没人监听的端口（比如 `http://127.0.0.1:19999`）再起网关，
+     访问任意接口应该返回 **502**，响应体里带上这次请求的 trace id，控制台打一行错日志。
+     这一步是确认「上游挂了网关不会崩，而且能顺着 trace id 找到原因」。
+
+- 完成标志：上面 6 步全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
+  （骨架阶段的现状：`gofmt` / `vet` / `build` 已经干净，但 6 步验证里只有第 1 步能过——
+  因为 6 个空都还没填。这正是「挖空」的正常状态。）
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

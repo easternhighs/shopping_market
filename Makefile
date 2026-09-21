@@ -1,10 +1,18 @@
-.PHONY: run build env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
 
 build:
 	go build -o bin/server ./cmd/server
+
+# 阶段 13：API 网关。它站在 cmd/server 前面当统一入口，长跑在另一个端口上（默认 :8081）。
+# 网关是旁路式的：不启动它，cmd/server 也照常工作，压测脚本继续直连 8080。
+run-gateway:
+	go run ./cmd/gateway
+
+build-gateway:
+	go build -o bin/gateway ./cmd/gateway
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d
