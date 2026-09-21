@@ -132,78 +132,92 @@ function flash(text, ok) {
 }
 
 /* ============================================================
-   留给你实现的部分（1/2）
+   结算链路的核心四步：查表 → 算合计 → 下单 → 支付
    ============================================================ */
 
-/* TODO(你来实现)：按 sku_id 找到「它是哪个商品、什么规格、卖多少钱」。
+/* 按 sku_id 找到「它是哪个商品、什么规格、卖多少钱」。
    为什么需要它：购物车的 cart_items 表只存了 sku_id 和数量，没有商品名和价格，
    所以页面得自己从 /shop/data 里把这两样查出来。
 
-   输入：skuID —— 一个数字，比如 16
-   输出：{ product: 商品对象, sku: 规格对象 }；查不到就返回 null
-
-   提示：catalog.products 是个数组，每一项长这样：
-        { id: 13, name: "演示手表 · 星河 Watch", price: 999,
-          skus: [ { id: 14, spec: "46mm 黑色", price: 999 }, ... ] }
-   两层循环就能查出来（商品总共十几个，这个页面也没有每秒刷新的压力）。
-
    为什么不让后端一次把名字拼好：和「我的秒杀订单」里 productNameOfItem 一个道理 ——
    页面本来就要拉 /shop/data，手上已经有这份数据了，让服务端再回查一遍数据库是白花一次查询。
-   商品被删掉时会查不到，返回 null，渲染那里会显示一行提示，不影响页面其他部分。 */
+   商品被删掉时会查不到，返回 null，渲染那里会显示一行提示，不影响页面其他部分。
+
+   返回：{ product: 商品对象, sku: 规格对象 }；查不到就是 null。 */
 function findSKU(skuID) {
+  if (!catalog || !Array.isArray(catalog.products)) return null;
+
+  for (const product of catalog.products) {
+    const skus = product.skus || [];
+    for (const sku of skus) {
+      if (Number(sku.id) === Number(skuID)) return { product: product, sku: sku };
+    }
+  }
   return null;
 }
 
-/* TODO(你来实现)：算出购物车合计金额，单位是元。
-   输入：全局变量 cartItems，形如 [ { id: 3, sku_id: 16, quantity: 3 }, ... ]
-   输出：一个数字，比如 447
+/* 算出购物车合计金额，单位是元：每一行的小计 = 单价 × 数量，再把每一行加起来。
+   单价用上面的 findSKU() 拿；查不到的行按 0 算。
 
-   提示：每一行的小计 = 那个 SKU 的单价 × 这一行的数量；把每一行加起来就是合计。
-        单价用上面的 findSKU() 拿；查不到的行按 0 算。
-   想一想：金额是浮点数，前端算出来的只用来「显示」。真正的对账要以服务端为准 ——
-        而本项目 orders 表里根本没有金额列，这是个可以直接跟面试官说的简化。 */
+   注意：前端算出来的金额只用来「显示」，真正的对账要以服务端为准 ——
+   而本项目 orders 表里根本没有金额列，这是个可以直接跟面试官说的简化。 */
 function cartTotal() {
-  return 0;
+  return cartItems.reduce(function (sum, it) {
+    const found = findSKU(it.sku_id);
+    if (!found) return sum;
+    return sum + Number(found.sku.price) * Number(it.quantity);
+  }, 0);
 }
 
-/* TODO(你来实现)：结算的核心动作 —— 把购物车里的东西提交成一张订单。
-   调的是 POST /orders，也就是「普通下单」接口（不是秒杀那套）。
+/* 结算的核心动作 —— 把购物车里的东西提交成一张订单（POST /orders，普通下单接口，不是秒杀那套）。
 
-   要做的四件事：
-     1. 生成 request_id。用 "cart-" + Date.now() 就够，它必须每单唯一。
-        为什么要它：服务端拿它做幂等键。同一次提交重复发出去（网络抖动重试、用户连点两下）
-        只会产生一笔订单，不会重复扣库存。
-     2. 把 cartItems 转成接口要的格式：
-            const items = cartItems.map((it) => ({ sku_id: it.sku_id, quantity: it.quantity }));
-     3. 发请求：
-            const r = await api("/orders", { method: "POST", auth: true,
-                                             body: { request_id: rid, items: items } });
-     4. 成功了（r.ok 为 true）：把 r.data.order 存进全局变量 orderResult，
-        再把购物车清空（checkoutOpen = false，然后 refreshCart()）。
-        失败了：flash("下单失败：HTTP " + r.status + " " + (r.data.error || ""), false)。
-        库存不足就会走到这里 —— 服务端扣库存失败，整个事务回滚，一笔订单都不会留下。
+   为什么要一个 request_id：服务端拿它做幂等键。同一次提交重复发出去（网络抖动重试、
+   用户连点两下）只会产生一笔订单，不会重复扣库存。
 
-   顺便体会一下：这个接口返回的 order.id 是数据库当场生成的真实订单号。
-   秒杀那边完全相反 —— 抢购接口先返回 id=0，要等 Kafka 消费者落库之后才查得到。
-   原因就是这里走的是同步事务，而秒杀把落库这一步丢给了消息队列。 */
+   注意接口返回的 order.id 是数据库当场生成的真实订单号。秒杀那边完全相反 ——
+   抢购接口先返回 id=0，要等 Kafka 消费者落库之后才查得到：这里走的是同步事务，
+   秒杀把落库这一步丢给了消息队列。 */
 async function placeOrder() {
+  if (!token) { flash("请先登录", false); return; }
+  if (cartItems.length === 0) { flash("购物车是空的，没有可提交的商品", false); return; }
+
+  const rid = "cart-" + Date.now();
+  const items = cartItems.map(function (it) { return { sku_id: it.sku_id, quantity: it.quantity }; });
+
+  const r = await api("/orders", { method: "POST", auth: true,
+                                   body: { request_id: rid, items: items } });
+
+  if (!r.ok) {
+    flash("下单失败：HTTP " + r.status + " " + (r.data.error || ""), false);
+    return;
+  }
+
+  orderResult = r.data.order;
+  checkoutOpen = false;
+  await refreshCart();
+  flash("下单成功，订单号 #" + orderResult.id, true);
 }
 
-/* TODO(你来实现)：模拟支付。
-   调 POST /orders/:id/pay，把订单状态从 pending 改成 paid。
+/* 模拟支付：把订单状态从 pending 改成 paid（POST /orders/:id/pay）。
 
-   提示：调用 api 时路径是 "/orders/" + orderID + "/pay"，方法 "POST"，要带 auth: true。
-        成功后把 orderResult.status 改成 "paid"，再 render() 一次。
-        失败就 flash 出服务端的错误信息。
-
-   想一想：真实项目这里会跳去支付渠道、等渠道异步回调，所以「支付」本身也要防重复通知；
-        本项目用一个接口代替，但 order 模块的 Pay 会检查「状态必须是 pending」，
-        重复支付会被拒绝（返回 400「订单状态不允许该操作」）。 */
+   真实项目这里会跳去支付渠道、等渠道异步回调，所以「支付」本身也要防重复通知；
+   本项目用一个接口代替，但 order 模块的 Pay 会检查「状态必须是 pending」，
+   重复支付会被拒绝（返回 400「订单状态不允许该操作」）。 */
 async function payOrder(orderID) {
+  const r = await api("/orders/" + orderID + "/pay", { method: "POST", auth: true });
+
+  if (!r.ok) {
+    flash("支付失败：HTTP " + r.status + " " + (r.data.error || ""), false);
+    return;
+  }
+
+  if (orderResult) orderResult.status = "paid";
+  render();
+  flash("支付成功，订单状态已变成 paid", true);
 }
 
 /* ============================================================
-   下面这些已经写好了，你可以直接读，不用改
+   页面其余部分：登录区 / 拉数据 / 渲染 / 事件绑定
    ============================================================ */
 
 /* ---------------- 登录区 ---------------- */
@@ -448,40 +462,9 @@ function renderOrderResult() {
   '</div>';
 }
 
-/* 这份清单列出的就是「留给你实现的部分」。填完一个，刷新页面再看效果。 */
-const BLANKS = [
-  ["findSKU(skuID)", "internal/shop/web/cart.html",
-   "把明细里的 sku_id 换成商品名 / 规格 / 单价 —— 从 /shop/data 里查表。"],
-  ["cartTotal()", "internal/shop/web/cart.html",
-   "把每一行的小计（单价 × 数量）加起来，得到合计金额。"],
-  ["addToCart(skuID, quantity)", "internal/shop/web/index.html",
-   "商品详情页点「加入购物车」：POST /cart/items。"],
-  ["placeOrder()", "internal/shop/web/cart.html",
-   "结算：生成 request_id → POST /orders → 成功后清空购物车、切到订单详情。"],
-  ["payOrder(orderID)", "internal/shop/web/cart.html",
-   "模拟支付：POST /orders/:id/pay，成功后把状态改成 paid。"],
-  ["购物车明细的归属校验", "internal/cart/service.go",
-   "修越权：UpdateQuantity / RemoveItem 现在只看明细 id，不看这条明细属于谁。"]
-];
-
-function renderBlanks() {
-  if (document.body.dataset.hideBlanks === "1") return "";
-
-  const rows = BLANKS.map(function (b) {
-    return '<tr><td><code>' + esc(b[0]) + '</code></td><td><code>' + esc(b[1]) + '</code></td><td>' + esc(b[2]) + '</td></tr>';
-  }).join('');
-
-  return '<div class="panel">' +
-    '<h2>留给你实现的部分</h2>' +
-    '<p class="hint">这几个函数体里写着 <code>TODO(你来实现)</code>。填完刷新页面就能看到效果；' +
-    '在这之前，页面不会崩，只是对应的那一步没反应（金额显示 0、点提交没动静）。</p>' +
-    '<table><tr><th>函数 / 位置</th><th>文件</th><th>要做什么</th></tr>' + rows + '</table>' +
-  '</div>';
-}
-
 function render() {
   $("banner").innerHTML = renderBanner();
-  $("view").innerHTML = (orderResult ? renderOrderResult() : renderCart()) + renderBlanks() + renderWhy();
+  $("view").innerHTML = (orderResult ? renderOrderResult() : renderCart()) + renderWhy();
   bind();
 }
 
@@ -531,10 +514,8 @@ function bind() {
        但订单详情里还要把这一单买了什么、多少钱显示出来。 */
     lastSubmit = { items: cartItems.slice(), total: cartTotal() };
 
-    const before = orderResult;
     try {
       await placeOrder();
-      if (orderResult === before) flash("placeOrder() 还没实现 —— 见下面「留给你实现的部分」。", false);
     } catch (e) {
       flash("提交失败：" + e, false);
     } finally {
@@ -545,12 +526,8 @@ function bind() {
 
   const pay = $("payBtn");
   if (pay) pay.onclick = async function () {
-    const before = orderResult && orderResult.status;
     try {
       await payOrder(orderResult.id);
-      if (orderResult && orderResult.status === before) {
-        flash("payOrder() 还没实现 —— 见下面「留给你实现的部分」。", false);
-      }
     } catch (e) {
       flash("支付失败：" + e, false);
     }

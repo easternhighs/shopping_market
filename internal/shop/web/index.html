@@ -241,28 +241,28 @@ async function doRegister() {
 }
 
 /* ============================================================
-   留给你实现的部分
+   加入购物车
    ============================================================ */
 
-/* TODO(你来实现)：把一个规格加进购物车。
-   「商品详情」表格里每一行的「加入购物车」按钮，点了就会走到这里。
+/* 把一个规格加进购物车。「商品详情」表格里每一行的「加入购物车」按钮，点了就走到这里。
 
-   输入：skuID —— 规格 ID（表格里的按钮和数量框都带着它）
-        quantity —— 用户填的数量
-   要做的：
-     1. 没登录就别发请求（token 为空时直接用 flash 提示「请先登录」）。
-     2. 调接口：
-            const r = await api("/cart/items", { method: "POST", auth: true,
-                                                 body: { sku_id: skuID, quantity: quantity } });
-        注意接口要的字段名是 sku_id（下划线），不是 skuID —— 服务端的 JSON 标签就是这么定的。
-     3. r.ok 就 flash("已加入购物车，点顶部「购物车」去结算", true)；
-        否则把服务端的错误显示出来：flash("加入失败：HTTP " + r.status + " " + (r.data.error || ""), false)。
-     4. 别忘了 await；数量非法（小于 1）时先提示，不要发请求。
+   注意接口要的字段名是 sku_id（下划线），不是 skuID —— 服务端的 JSON 标签就是这么定的。
 
-   想一想：同一个 SKU 加两次会发生什么？去看 internal/cart/service.go 的 AddItem ——
-   服务端会找到已有明细把数量叠加上去，而不是插一条重复的记录。这样购物车里
-   一个规格永远只有一行，结算时不用先合并。 */
+   同一个 SKU 加两次会怎样：internal/cart/service.go 的 AddItem 会找到已有明细把数量叠加上去，
+   而不是插一条重复记录。所以购物车里一个规格永远只有一行，结算时不用先合并。 */
 async function addToCart(skuID, quantity) {
+  if (!token) { flash("请先登录", false); return; }
+
+  const qty = Number(quantity);
+  if (!qty || qty < 1) { flash("数量必须大于 0", false); return; }
+
+  const r = await api("/cart/items", { method: "POST", auth: true,
+                                       body: { sku_id: skuID, quantity: qty } });
+  if (!r.ok) {
+    flash("加入失败：HTTP " + r.status + " " + (r.data.error || ""), false);
+    return;
+  }
+  flash("已加入购物车，点顶部「购物车」去结算", true);
 }
 
 /* ---------------- 数据轮询 ---------------- */

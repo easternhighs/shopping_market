@@ -77,6 +77,11 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 	}
 
 	if err := h.service.UpdateQuantity(userID, uint(itemID), req.Quantity); err != nil {
+		// 明细不存在或不属于当前用户，对外统一说「不存在」（理由见 ErrItemNotOwned 的注释）。
+		if err == ErrItemNotOwned {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -95,6 +100,10 @@ func (h *Handler) RemoveItem(c *gin.Context) {
 	}
 
 	if err := h.service.RemoveItem(userID, uint(itemID)); err != nil {
+		if err == ErrItemNotOwned {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

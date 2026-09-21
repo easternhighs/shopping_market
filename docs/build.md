@@ -650,7 +650,7 @@ shopping_market/
 - 完成标志：`k6 inspect` 能解析 `scripts/` 下两个脚本；按附录 B 实跑走通
   「抢到 → 倒计时 → 超时关单 → 库存回补」；`gofmt` / `go vet` / `go build` 全部通过。**已达成。**
 
-### 阶段 12：购物车与结算页（进行中）
+### 阶段 12：购物车与结算页（已完成）
 
 - 为什么补这一章：前 11 个阶段把「秒杀」这条链路做到了能扛 1 万 QPS，但面试官几乎一定会追问一句
   「那**普通下单**你们怎么做？」。阶段 3 早就写好了购物车与订单接口，只是一直没有页面能点，
@@ -666,7 +666,8 @@ shopping_market/
 - 新增内容：
   - `internal/shop/web/cart.html`：购物车 + 结算页。明细表（商品 / 规格 / 单价 / 数量 / 小计 / 操作）、
     改数量、删除、合计、可展开的结算面板（收货信息表单，仅本地校验、不发给后端）、提交订单、模拟支付、
-    订单详情回显。页底还有两块面试话术：「留给你实现的部分」清单、同步事务与异步最终一致的对比。
+    订单详情回显。页底还有一块面试话术：同步事务与异步最终一致的对比（练习阶段的「留给你实现的部分」
+    面板在填空完成后已移除）。
   - `internal/shop/web/index.html` 商品列表页：导航加「购物车」入口；商品行新增「购物车」列
     （数量框 + 加入按钮）；给 1 秒一次的自动刷新加了 `isEditing()` 判断，
     避免重绘把正在输入的数字冲掉。
@@ -686,29 +687,42 @@ shopping_market/
     | 模拟支付 | `POST /orders/:id/pay` |
     | 商品名 / 规格 / 单价 | `GET /shop/data`（前端查表拼接） |
 
-- **留给你填的空（5 个）**——按挖空规则，这些函数体里只有注释和 `TODO(你来实现)`：
+- 这一章先按挖空规则留了 5 个前端函数 + 1 处越权校验，后来你直接要求「一次性写完」，现在都填好了：
 
-  | 文件 | 函数 | 它要做什么 |
+  | 文件 | 函数 | 它做了什么 |
   | --- | --- | --- |
-  | `internal/shop/web/cart.html` | `findSKU(skuID)` | 从 `/shop/data` 里按 sku_id 查出商品、规格、单价；查不到返回 `null` |
-  | `internal/shop/web/cart.html` | `cartTotal()` | 逐行「单价 × 数量」求和，得到合计金额 |
-  | `internal/shop/web/cart.html` | `placeOrder()` | 生成唯一 `request_id`（幂等键）→ 把 `cartItems` 映射成 `{sku_id, quantity}` → `POST /orders` → 成功就存下订单、清空购物车 |
-  | `internal/shop/web/cart.html` | `payOrder(orderID)` | `POST /orders/:id/pay`，成功后把状态改成 `paid` 再重绘 |
-  | `internal/shop/web/index.html` | `addToCart(skuID, quantity)` | 商品页的「加入购物车」按钮，`POST /cart/items` |
+  | `internal/shop/web/cart.html` | `findSKU(skuID)` | 双层循环扫 `catalog.products[].skus[]`，命中就返回 `{product, sku}`，查不到返回 `null` |
+  | `internal/shop/web/cart.html` | `cartTotal()` | `cartItems.reduce` 累加「单价 × 数量」，查不到 SKU 的行按 0 算 |
+  | `internal/shop/web/cart.html` | `placeOrder()` | 生成 `"cart-" + Date.now()` 当幂等键 → 把 `cartItems` 映射成 `{sku_id, quantity}` → `POST /orders` → 成功后存下订单、关掉结算面板、刷新购物车 |
+  | `internal/shop/web/cart.html` | `payOrder(orderID)` | `POST /orders/:id/pay`，成功后把 `orderResult.status` 改成 `paid` 再重绘 |
+  | `internal/shop/web/index.html` | `addToCart(skuID, quantity)` | 未登录 / 数量非法先在本地拦下，否则 `POST /cart/items` |
 
-- **第 6 个空是一道安全题**：实测发现 `demo2` 能改甚至删掉 `demo1` 的购物车明细，也能读别人的订单，
-  这是典型的**越权（IDOR）**。仓储层已经补好 `FindItemByIDForUser(itemID, userID)`
-  （一条 JOIN 把 `carts.user_id` 带进来），`internal/cart/service.go` 的
-  `UpdateQuantity` / `RemoveItem` 已改成接收 `userID`，**函数体留空**，
-  等你自己加上「这条明细是不是你的」校验。订单侧同样有问题，但为免范围蔓延，只在文档里说明、不动代码。
-- 怎么验证（按顺序走一遍就算完成）：
-  1. `go build ./...` 通过，起服务；
-  2. 浏览器打开 `/shop/cart`，用 `demo1` / `demo1234` 登录；
-  3. 去 `/shop` 加购，回购物车看到明细、数量、合计都对；
-  4. 改数量、删除各试一次；
-  5. 填收货信息提交订单，确认弹出的**订单号是真实自增号（不是 0）**，再点「模拟支付」看到状态变 `paid`；
-  6. 换 `demo2` 登录，尝试改 `demo1` 的明细，应该被拒绝（做完第 6 个空之后）。
-- 完成标志：上面 6 步走通、越权被挡下，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
+- **越权（IDOR）已修复**：实测发现 `demo2` 能改甚至删掉 `demo1` 的购物车明细。修法是「仓储层一次 JOIN + 服务层先验归属」：
+  - `internal/cart/repository.go` 加 `FindItemByIDForUser(itemID, userID)`，一条
+    `JOIN carts ON carts.id = cart_items.cart_id WHERE cart_items.id = ? AND carts.user_id = ?`，未命中返回 `(nil, nil)`。
+    把归属条件写进 SQL 而不是「先查出来再比较 CartID」：省一次数据库往返，更要紧的是调用方没有「忘了比较」的机会。
+  - `internal/cart/service.go` 的 `UpdateQuantity` / `RemoveItem` 先校验归属，不是自己的就返回 `ErrItemNotOwned`，
+    后面的更新 / 删除一行都不执行。
+  - 错误文案统一叫「购物车明细不存在」而不是「这不是你的明细」：后者等于告诉攻击者「这个 id 是存在的」，
+    他可以把 id 从小到大试一遍，数出别人有多少条明细。
+  - `internal/cart/handler.go` 把这个错误映射成 **404**。顺带说明：`quantity <= 0` 目前仍返回 500（按语义应该是 400），
+    属于既有小瑕疵，本轮没动。
+  - 订单侧的同类问题（`GET /orders/:id`、`POST /orders/:id/pay`、`cancel` 都只认订单号不认人）
+    **只在本章说明、未改代码** —— 修法一样（把 `user_id` 带进查询），留作后续可选项。
+- 已知简化（面试可以直接说）：下单成功后购物车里的明细**不会自动清掉**，页面只是切到订单详情。
+  真做电商应该在同一个事务里删掉已下单的明细；本项目为了不动阶段 3 的订单服务，先这样放着。
+- 实测结果（本轮实跑，服务用 `SECKILL_PAY_TIMEOUT=30s` 起）：
+  - `gofmt -l cmd internal` 无输出、`go vet ./...` / `go build ./...` 通过；三个页面的内联脚本过 node 语法检查。
+  - DOM 桩里打真实接口：`catalog.products` 拿到 14 个商品；`findSKU(16)` 解析出「演示充电宝 · 随行 20000 / 20000mAh / ¥149」；
+    `findSKU(999999)` 返回 `null`；`cartTotal()` = 149；`placeOrder()` 建出订单 `#12`（数据库当场生成的真实自增号）、
+    页面切到订单详情；`payOrder()` 之后状态变 `paid`、页面显示「支付完成」。
+  - 越权用例：`demo2` 改 / 删 `demo1` 的明细都返回 **404「购物车明细不存在」**；`demo2` 改一个不存在的 id
+    也是同样的 404（不泄露「存不存在」）；`demo1` 改自己的明细返回 200。
+  - 加购用例：未登录提示「请先登录」、数量填 0 提示「数量必须大于 0」、正常加购回「已加入购物车」；
+    同一个 SKU 连加两次会合并成一条明细（数量累加），不会出现重复行。
+  - 重复支付被拒：`POST /orders/11/pay` 第二次返回 400「订单状态不允许该操作」。
+- 完成标志：上面这些用例全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。**已达成。**
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

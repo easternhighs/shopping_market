@@ -4,17 +4,26 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 12 进行中**（购物车与结算页）。后端接口与三个前台页面都已就绪，`GET /shop/cart` 返回 200；按要求留了 **5 个前端函数空 + 1 处越权校验空** 等你动手填，填完之后按 `docs/build.md` 阶段 12 的 6 步走一遍即可收口
-- 本次完成：**阶段 12 购物车与结算页：把「普通下单」这条链路也变成能点的页面**（进行中：骨架已就绪，空留给你填）
+- 当前阶段：**阶段 12 已完成**（购物车与结算页）。5 个前端函数与购物车越权校验已全部填完并实跑验证：`/shop/cart` 能从购物车一路点到「提交订单 → 支付成功」，`demo2` 改 / 删 `demo1` 的购物车明细一律 404。往后是可选收尾项（订单侧越权、部署说明、按需拆微服务），也可以按你的面试重点直接换方向
+- 本次完成：**阶段 12 收口：把 5 个前端函数和 1 处越权校验全部填完，普通下单链路现场可点、越权被挡住**（阶段 12 完成）
+  - 要解决的问题：上一轮把页面骨架和「空」都摆好了，但结算按钮点了没反应、`demo2` 还能改删 `demo1` 的购物车明细。这两件事不解决，阶段 12 就只是一张假页面
+  - 填完 5 个前端函数：`cart.html` 的 `findSKU(skuID)`（拿 SKU 号在 `GET /shop/data` 的目录里两层循环查表，命中返回 `{product, sku}`、否则 `null`）、`cartTotal()`（`reduce` 把每行「单价 × 数量」累加成合计，查不到的 SKU 按 0 算）、`placeOrder()`（拼 `request_id = "cart-" + 时间戳`，把购物车明细映射成 `[{sku_id, quantity}]` 调 `POST /orders`，成功后把订单对象存进 `orderResult` 并切到订单详情）、`payOrder(orderID)`（调 `POST /orders/:id/pay`，成功后把订单状态改成 `paid` 并重绘）；`index.html` 的 `addToCart(skuID)`（未登录 / 数量小于 1 先拦，否则 `POST /cart/items`）
+  - 填完越权校验（IDOR）：`internal/cart/service.go` 的 `UpdateQuantity` / `RemoveItem` 先调仓储层的 `FindItemByIDForUser(itemID, userID)` —— 这条 SQL 把 `user_id` 写进 `WHERE`，查不到就返回 `ErrItemNotOwned`，Service 直接返回、不再往下执行改 / 删；`internal/cart/handler.go` 把 `ErrItemNotOwned` 映射成 **404「购物车明细不存在」**
+  - 为什么回 404 而不是 403：403 等于告诉攻击者「这条明细真实存在，只是不属于你」，白送一个「哪些 id 有效」的探测接口；统一回 404，让「不存在」和「不是你的」长得一模一样
+  - 顺手清掉练习脚手架：`cart.html` 里的 `BLANKS` 数组、`renderBlanks()` 及其调用、两处「xxx() 还没实现」的兜底提示全部删除，页底改成「结算链路的核心四步」说明；全库 `TODO(你来实现)` **0 命中**
+  - 实测（`.tmp/server_cart.exe` + `SECKILL_PAY_TIMEOUT=30s`，:8080）：`gofmt -l cmd internal` 无输出、`go vet ./...` / `go build ./...` 通过；三个页面的内联脚本过 node 语法检查；用 DOM 桩直接打真实接口 —— `findSKU(16)` 命中「演示充电宝 · 随行 20000 / 20000mAh / ¥149」、`findSKU(999999)` 返回 `null`、`cartTotal()` = 149；点结算真实拿到自增订单 `#12` 并切到详情、点支付后状态变 `paid`；加购未登录提示「请先登录」、数量 0 提示「数量必须大于 0」、同一 SKU 连加两次合并成一条 `quantity=2`
+  - 越权实测：`demo2` 对 `demo1` 的明细 id=3 做 `PATCH`（qty=777）/ `DELETE` 全部 404「购物车明细不存在」，`PATCH` 一个不存在的 id=999999 也是同样的 404；`demo1` 改自己的明细仍然 200。`demo2` 购物车明细数为 0，`demo1` 的 `id=3 / sku=16 / qty=1` 原样未动
+  - 其他复核：重复支付第二遍返回 400「订单状态不允许该操作」；`GET /shop/cart` 返回 200、23934 字节、`TODO` 计数 0；秒杀链路一个字没动（Redis 脚本、Kafka、压测过的热路径都没碰），阶段 6 的 1 万 QPS 结论依旧成立
+  - 已知简化（同步写进了 `docs/build.md`）：① 下单成功后购物车明细不会自动清空，要手动删，是演示用的简化；② 订单侧的越权（`GET /orders/:id`、`pay`、`cancel` 只认订单号、不校验这单是不是你的）本轮只在文档里说明、没有改代码，避免范围蔓延；③ `PATCH` 传 `quantity <= 0` 会走数据库报错返回 500 而不是 400，是阶段 3 就留下的瑕疵
+- 上一轮完成：**阶段 12 骨架：把「普通下单」这条链路也变成能点的页面**（骨架已就绪，空留到本轮填完）
   - 要解决的问题：前 11 个阶段把秒杀链路做到了 1 万 QPS，但面试官几乎一定会追问「那普通下单你们怎么做？」。阶段 3 的购物车 / 订单接口一直都在，只是没有页面能点，现场只能靠 curl，讲起来很干。这一章补前台页面，让一次演示里能并排看到**两条下单链路**：常规链路（同步事务、强一致、直接扣 MySQL 库存）vs 秒杀链路（Redis 预扣 + Kafka 异步落库、最终一致）
-  - 新增 `internal/shop/web/cart.html`（购物车 + 结算页）：明细表（商品 / 规格 / 单价 / 数量 / 小计 / 操作）、改数量、删除、合计、可展开的结算面板（收货信息仅本地校验、不发给后端）、提交订单、模拟支付、订单详情回显；页底两块面试话术 ——「留给你实现的部分」清单、同步事务 vs 异步最终一致对比
+  - 新增 `internal/shop/web/cart.html`（购物车 + 结算页）：明细表（商品 / 规格 / 单价 / 数量 / 小计 / 操作）、改数量、删除、合计、可展开的结算面板（收货信息仅本地校验、不发给后端）、提交订单、模拟支付、订单详情回显；页底两块面试话术 ——「留给你实现的部分」清单（本轮已移除）、同步事务 vs 异步最终一致对比
   - `internal/shop/web/index.html` 商品列表页：导航加「购物车」入口，商品行新增「购物车」列（数量框 + 加入按钮）；给每秒一次的自动刷新加 `isEditing()` 判断，避免重绘冲掉正在输入的数字
   - 三个页面（`/shop`、`/shop/seckill`、`/shop/cart`）导航互通，登录态共用同一个 `localStorage` 键。页面本身公开，私有数据全靠接口上的 JWT 中间件把守
   - 后端只做最小改动：`internal/shop/handler.go` 加 `//go:embed web/cart.html` + `CartPage`；`internal/shop/router.go` 注册 `GET /shop/cart`。页面调的接口全是阶段 3 就有的 —— 打开购物车 `GET /cart/items`、加购 `POST /cart/items`、改数量 `PATCH /cart/items/:item_id`、删除 `DELETE /cart/items/:item_id`、下单 `POST /orders`、支付 `POST /orders/:id/pay`，商品名 / 规格 / 单价来自 `GET /shop/data` 前端查表
-  - **留给你填的空（5 个）**：`cart.html` 的 `findSKU()`、`cartTotal()`、`placeOrder()`、`payOrder()`，`index.html` 的 `addToCart()`；函数体里只有注释 + `TODO(你来实现)`
-  - **第 6 个空是一道安全题**：实测发现 `demo2` 能改 / 删 `demo1` 的购物车明细，也能读别人的订单，是典型的越权（IDOR）。仓储层已补 `FindItemByIDForUser(itemID, userID)`，`internal/cart/service.go` 的 `UpdateQuantity` / `RemoveItem` 已改成接收 `userID`，**校验逻辑留空**。订单侧同类问题只在文档里说明、不动代码（避免范围蔓延）
-  - 已实测：`gofmt -l cmd internal` 干净，`go vet ./...`、`go build ./...` 通过；三个页面的内联脚本过 node 语法检查；`GET /shop/cart` 返回 200 并检出 5 处 `TODO(你来实现)`；接口链路实跑通（加购 sku16×2 → 改 3 → `POST /orders` 拿到真实自增订单号 → 支付变 `paid`）；越权复现成功（`demo2` 改 `demo1` 的明细返回「已更新」，修完第 6 个空后应被拒绝）
-  - 下一步计划：你来填上面 5 个前端函数 + 1 处越权校验，填完按 `docs/build.md` 阶段 12 的 6 步验证走一遍，我再帮你检查
+  - 留出的空（5 个）：`cart.html` 的 `findSKU()`、`cartTotal()`、`placeOrder()`、`payOrder()`，`index.html` 的 `addToCart()`；函数体里只有注释 + `TODO(你来实现)`（本轮已全部填完，见上）
+  - **第 6 个空是一道安全题**：实测发现 `demo2` 能改 / 删 `demo1` 的购物车明细，也能读别人的订单，是典型的越权（IDOR）。仓储层补上 `FindItemByIDForUser(itemID, userID)`，`internal/cart/service.go` 的 `UpdateQuantity` / `RemoveItem` 改成接收 `userID`，**校验逻辑当时留空**（本轮已填完）。订单侧同类问题只在文档里说明、不动代码（避免范围蔓延）
+  - 已实测：`gofmt -l cmd internal` 干净，`go vet ./...`、`go build ./...` 通过；三个页面的内联脚本过 node 语法检查；`GET /shop/cart` 返回 200 并检出 5 处 `TODO(你来实现)`；接口链路实跑通（加购 sku16×2 → 改 3 → `POST /orders` 拿到真实自增订单号 → 支付变 `paid`）；越权复现成功（`demo2` 改 `demo1` 的明细返回「已更新」；本轮填完校验后实测已变成 404，见上）
   - 顺带说明：秒杀链路一个字都没动（不碰 Redis 脚本、不碰 Kafka、不碰任何压测过的热路径），所以阶段 6 的压测结论依旧成立；`orders` 表没有金额列是阶段 3 的已知简化，页面上的合计是前端按 `GET /shop/data` 的价格算的
 - 上一轮完成：**阶段 11 面试演练与资料收口：把「代码写完了」变成「现场讲得出来、换台机器也跑得起来」**
   - 要解决的问题：演练材料里有两处会在面试现场直接炸掉 —— ① 演示页生成的压测命令指向 `.tmp/k6_bench.js`，而 `.tmp/` 不进版本库，换台机器**必然报「找不到脚本」**；② 附录 B 的双屏脚本讲到「已抢到（订单 #xxx）」就转去讲限购了，**完全没覆盖阶段 9 的「抢到不付款 → 超时关单 → 库存回补」**，而那正是本项目第二个核心亮点
@@ -125,4 +134,4 @@
 - [x] 阶段 9：订单超时关单与库存回补（延时队列 ZSET + 兜底扫描、两层幂等、`idx_user_item` 降级、付款倒计时）
 - [x] 阶段 10：滑动窗口限流（ZSET 记放行时刻，抢购热路径与秒杀管理接口两处都改，A/B 实测证明边界放水消失）
 - [x] 阶段 11：面试演练与资料收口（k6 脚本进版本库、附录 A/B 补上超时关单与滑动窗口、照着脚本实跑验证）
-- [ ] 阶段 12：购物车与结算页（/shop/cart 页面 + 商品页加购列；5 个前端函数空 + 1 处越权校验空待填）
+- [x] 阶段 12：购物车与结算页（/shop/cart 页面 + 商品页加购列；5 个前端函数与购物车越权校验均已实现并实测）
