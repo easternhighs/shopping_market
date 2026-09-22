@@ -43,8 +43,12 @@ shopping_market/
 │  ├─ build.md               # 本构建文档
 │  └─ progress.md            # 进度记录
 ├─ cmd/
-│  └─ server/
-│     └─ main.go             # 程序入口
+│  ├─ server/
+│  │  └─ main.go             # 单体入口（所有模块装在一起，默认 :8080）
+│  ├─ gateway/
+│  │  └─ main.go             # API 网关（阶段 13，默认 :8081）
+│  └─ user/
+│     └─ main.go             # 用户服务（阶段 14，默认 :8082）
 ├─ internal/
 │  ├─ config/                # 配置读取
 │  ├─ pkg/                   # 通用小工具（响应格式、错误码、中间件等）
@@ -822,6 +826,113 @@ shopping_market/
   `GATEWAY_BACKEND=http://127.0.0.1:19999` 时回 **502**，响应头和日志里都带同一条 trace id。
   另外用一个临时回显服务当上游，确认了「`X-Trace-Id` 确实转发给了下游」「客户端伪造的 `X-User-Id` 被摘掉」「`Path` 没有被改写」。
 - 遗留（阶段 14 补）：trace id 目前只是**从网关发给了下游**，下游（现在这个单体）还没接 `trace.Middleware`、日志里也还没打这个编号。
+
+### 阶段 14：拆 user-service（进行中）
+
+- 为什么做这一章：阶段 13 把网关立起来之后，「哪个路径归哪个服务」已经写进了路由表，
+  但所有路径最后还是转给同一个单体——等于门立起来了，屋里还是同一间房。
+  这一章开始**真的把模块搬出去**，第一个挑用户模块，理由有三个：
+  ① 它最小、依赖最少（只读 MySQL 一张 `users` 表），搬走风险最低；
+  ② 它和秒杀热路径完全无关，搬走不会影响性能主线（阶段 15 拆秒杀才是要复测 QPS 的那一步）；
+  ③ 它是「鉴权」这件事的源头——把它拆出去，「网关验一次、下游信头部」这条微服务最关键的
+  设计才真正落地（见 `docs/microservices.md` 第 5.1 节）。
+- 这一章的关键词是「**搬家，不是重写**」：`internal/user` 里的业务代码
+  （`service.go` / `repository.go` / `model.go`）**一行都不改**，只做三件事：
+  1. 新增 `cmd/user`，把它单独跑成一个进程（默认 `:8082`）；
+  2. 把「用哪个鉴权中间件」从模块内部挪到调用方决定（`RegisterRoutes` 多收一个 `auth` 参数）；
+  3. 给下游（新的用户服务、以及单体）补上 `trace.Middleware`，
+     把阶段 13 留下的「编号传下来了但没人接」补完。
+- 这一章刻意不做的事：不动秒杀热路径；不引入服务发现和配置中心（服务数量固定，一个环境变量足够）；
+  不删单体里的用户模块（留着当退路，见下面 `USER_MODULE` 的说明）。
+
+- 改动与新增的文件：
+
+  | 文件 | 作用 | 状态 |
+  | --- | --- | --- |
+  | `cmd/user/main.go` | 用户服务进程入口：`USER_ADDR`、`GET /healthz`、防御性超时、优雅退出 | 完整 |
+  | `internal/user/auth.go` | 鉴权中间件改成包级函数 `AuthMiddleware(trustHeader)`，含「信任 X-User-Id」的开关 `TrustHeaderFromEnv()` | **2 处留空** |
+  | `internal/user/router.go` | `RegisterRoutes` 多收一个 `auth gin.HandlerFunc`，鉴权由调用方决定 | 完整 |
+  | `cmd/server/main.go` | 所有受保护路由共用同一个鉴权中间件；新增 `USER_MODULE=0` 开关；补 `trace.Middleware` | 完整 |
+  | `Makefile` | 新增 `make run-user` / `make build-user` | 完整 |
+
+- **留给你填的 2 处空**（每个空上方都有一段注释，把思路、要求和容易踩的坑写清楚了）：
+
+  | # | 文件 | 函数 | 要做的事 | 验收点 |
+  | --- | --- | --- | --- | --- |
+  | 1 | `internal/user/auth.go` | `TrustHeaderFromEnv()` | 读环境变量 `TRUST_USER_ID_HEADER`，只有 `"1"` 或 `"true"`（忽略大小写、去掉首尾空格）才算「开」，其它一律「关」 | 不设变量时 `/healthz` 里 `trust_header` 是 `false`；设成 `1` 后变 `true` |
+  | 2 | `internal/user/auth.go` | `AuthMiddleware(trustHeader)` | 两段：①`trustHeader` 为真且 `X-User-Id` 有值 → 解析成数字放进上下文并放行（**解析失败要 401**），头里没值才往下走；②回退：`Authorization: Bearer <token>` → `jwt.Parse` → 放进上下文 | 带 token 走网关访问 `/me` → 200；不带 token → 401；伪造 `X-User-Id: abc` 直连 8082 → **401**（不是 200，也不是 500） |
+
+- 为什么空 1 必须「默认关、而且只认白名单」：
+  这个开关一旦打开，下游就**完全不检查令牌**了——请求头里写你是谁，你就是谁。
+  所以默认值必须选最保守的（关）。而判断写成「只有 `1`/`true` 算开」、
+  不能写成「只要不是 `0` 就算开」：后者遇到手滑写成 `flase` 会**静默打开**，没人会发现；
+  前者最坏只是「以为开了其实没开」，一试就知道。
+- 空 2 里最容易错的三点（注释里也写了，这里再点一遍）：
+  1. **「解析失败」不等于「没有头」**。`X-User-Id` 里有值时，说明请求是「以网关的身份」进来的，
+     格式不对就只能 401，**不能放它去走 JWT 那条路**——那等于给一个畸形请求第二条命。
+  2. **不要在下游再删一次 `X-User-Id`**。网关已经做过「先删客户端伪造的、再写自己的结论」，
+     下游再删一次就把自己要读的值删掉了，信任头模式直接失效。
+  3. **失败一律用 `c.AbortWithStatusJSON`**，不要用 `c.JSON`。用后者的话，
+     鉴权失败了后面的 handler 还会照常执行——等于没鉴权。
+- 启动方式（三个进程，各开一个窗口）：
+
+  `~powershell
+  # 窗口 1：单体。USER_MODULE=0 表示「用户路由不在这里注册」，
+  #         这样能证明 /login /me 真的搬到 8082 去了；不设这个变量也能跑，那是退路。
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  $env:USER_MODULE="0"
+  go run ./cmd/server
+
+  # 窗口 2：用户服务。TRUST_USER_ID_HEADER=1 表示信任网关注入的 X-User-Id。
+  $env:TRUST_USER_ID_HEADER="1"
+  make run-user            # 等价于 go run ./cmd/user
+
+  # 窗口 3：网关。GATEWAY_UPSTREAM_USER 把用户流量指向 8082。
+  $env:GATEWAY_UPSTREAM_USER="http://127.0.0.1:8082"
+  make run-gateway
+  `~
+
+  | 环境变量 | 默认值 | 说明 |
+  | --- | --- | --- |
+  | `USER_ADDR` | `:8082` | 用户服务的监听地址 |
+  | `TRUST_USER_ID_HEADER` | 空（关） | 设成 `1` / `true`：直接采用网关写下的 `X-User-Id`，不再自己验 JWT |
+  | `USER_MODULE` | 空（开） | 单体专用。设成 `0`：单体不再注册 `/login` `/register` `/me` |
+  | `GATEWAY_UPSTREAM_USER` | 空 | 网关专用。设成 `http://127.0.0.1:8082` 把用户流量转走 |
+
+- 验证流程（按顺序走一遍；在空 1、空 2 都填完之后做）：
+  1. 三个进程都在：`8080`（单体）、`8082`（用户服务）、`8081`（网关）。
+  2. `GET http://127.0.0.1:8082/healthz` → **200**，里面 `service` 是 `user`、
+     `trust_header` 是 `true`。是 `false` 就说明空 1 没填对、或者环境变量没设上。
+  3. 直连单体确认搬走了：`GET http://127.0.0.1:8080/me` → **404**（因为设了 `USER_MODULE=0`）。
+     如果回的是 401，说明单体还注册着用户路由，`USER_MODULE` 没生效。
+  4. 走网关登录：`POST http://127.0.0.1:8081/login`，body 是
+     `{"username":"demo1","password":"demo1234"}` → **200**，拿到顶层 `token`。
+     这一步能过，就证明请求真的转到了 8082（单体那个接口已经 404 了）。
+  5. 带 token 走网关访问 `/me` → **200**。验证「网关验签 → 写 `X-User-Id` → 用户服务采信」通了。
+  6. 带 token 走网关访问 `/cart/items`、`/orders` → 照常 **200**。
+     这就是本阶段的验收标准原文：拆掉用户服务后，其它受保护接口不能受影响。
+  7. 异常输入：`curl -H "X-User-Id: abc" http://127.0.0.1:8082/me` → **401**。
+     返回 200 说明空 2 把「解析失败」错当成「没有头」了。
+     这一步顺带说明**为什么用户服务不能暴露公网**：直连之所以能伪造，只是因为它是内网服务；
+     一旦开到公网，攻击者写一个合法的数字就能冒充任意用户。
+  8. trace 串起来：挑一次请求，拿响应头里的 `X-Trace-Id`，
+     去**用户服务**的日志里搜同一个编号，应该搜得到（阶段 13 的遗留项在这里收尾）。
+- 留空期间的表现（已实测）：上面这 2 处空没填时，`AuthMiddleware` 会直接返回 **401**，
+  而不是「放行、什么都不做」。这个选择是刻意的，因为实测时踩出一个坑：
+  下游 handler 大多用 `userID := c.GetUint(contextUserID)` 取用户 ID，
+  上下文里没有这个键时 `GetUint` **安静地返回 0**、不报任何错——
+  于是 `/cart/items` 会以「用户 0」的身份正常返回 200，看起来一切正常，
+  实际上所有受保护接口都成了谁都进得去的门。宁可 401（看得见、立刻能发现），
+  也不要这种静默降级。
+- 骨架级实测（2 处空尚未填、三个进程 `8080 / 8081 / 8082` 都起来）：
+  `/healthz` 的 `trust_header` 是 **false**（空 1 还没填）；直连 8080 的 `/me` → **404**
+  （`USER_MODULE=0` 生效，用户路由确实不在单体里了）；走网关 `POST /login` → **200 + token**
+  （单体那个接口已经 404，能登录就说明请求真的转到了 8082）；
+  带 token 走网关访问 `/me`、`/cart/items` → **401「鉴权中间件还没实现」**（空 2 还没填）；
+  带畸形 `X-User-Id` 直连 8082 → **401**；
+  同一个 trace id 在网关日志和下游日志里各命中 **1 行**（阶段 13 遗留的「下游接 trace」已收尾）。
+- 完成标志：上面 8 步全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
+- 遗留（阶段 15 再做）：seckill 还在单体里。拆它是下一章，也是性能风险最大的一章——**必须复测 1 万 QPS**。
 
 ## 8. 挖空式协作规则
 

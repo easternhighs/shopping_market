@@ -1,4 +1,4 @@
-.PHONY: run build run-gateway build-gateway env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway run-user build-user env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -13,6 +13,18 @@ run-gateway:
 
 build-gateway:
 	go build -o bin/gateway ./cmd/gateway
+
+# 阶段 14：用户服务。把 internal/user 搬成独立进程（默认 :8082）。
+# 要让它真正接管流量，需要两件事配合：
+#   1) 网关那边设 GATEWAY_UPSTREAM_USER=http://127.0.0.1:8082，
+#      网关才会把 /login /register /me 转过来（网关代码一行都不用改）；
+#   2) 本服务设 TRUST_USER_ID_HEADER=1，它才会直接采用网关注入的 X-User-Id。
+#      不设也能正常工作（自己再验一遍 JWT），只是白多一次验签。
+run-user:
+	go run ./cmd/user
+
+build-user:
+	go build -o bin/user ./cmd/user
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d

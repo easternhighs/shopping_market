@@ -24,6 +24,7 @@ import (
 	"shopping_market/internal/pkg/metrics"
 	"shopping_market/internal/pkg/ratelimit"
 	redispkg "shopping_market/internal/pkg/redis"
+	"shopping_market/internal/pkg/trace"
 	"shopping_market/internal/product"
 	"shopping_market/internal/seckill"
 	"shopping_market/internal/shop"
@@ -83,6 +84,10 @@ func main() {
 	// 另外把运行模式设成 Release，关掉 Gin 在 Debug 模式下的额外输出。
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// trace 放在最前面：后面每个环节（包括 accessLog 打的那行出错日志）都要用到这个编号。
+	// 这也是阶段 13 的遗留项：阶段 13 只把 X-Trace-Id 从网关「发」了出来，
+	// 单体作为网关的下游，这里把编号接住——走网关时沿用网关的值，直连 8080 时自己生成。
+	r.Use(trace.Middleware())
 	r.Use(accessLog())
 	r.Use(gin.Recovery())
 	appMetrics := metrics.NewMetrics()
@@ -101,11 +106,24 @@ func main() {
 	r.GET("/metrics", gin.WrapH(appMetrics.Handler()))
 	metrics.RegisterObservabilityRoutes(r, sampler, alertEngine)
 
-	// 用户模块路由。
+	// 用户模块装配。
 	userRepo := user.NewRepository(dbConn)
 	userService := user.NewService(userRepo)
 	userHandler := user.NewHandler(userService)
-	user.RegisterRoutes(r, userHandler)
+
+	// 鉴权中间件（阶段 14）：所有需要登录的路由共用这一个。
+	// 它的两种模式由环境变量 TRUST_USER_ID_HEADER 决定（实现见 internal/user/auth.go）：
+	//   - 默认（没设）：老规矩，自己验 JWT —— 对应「单体单独启动、直连 8080」；
+	//   - 设成 1 / true：优先采用网关注入的 X-User-Id —— 对应「单体躲在网关后面」。
+	authMiddleware := user.AuthMiddleware(user.TrustHeaderFromEnv())
+
+	// USER_MODULE=0 时【不】注册用户路由（阶段 14 演示「真的拆出去了」用）：
+	// 这时 /login /register /me 只由 cmd/user 那个独立进程提供，必须过网关才能访问；
+	// 单体自己就只剩业务接口了。
+	// 默认（不设这个变量）仍然注册，保证「单体服务仍可单独启动」这条验收标准。
+	if os.Getenv("USER_MODULE") != "0" {
+		user.RegisterRoutes(r, userHandler, authMiddleware)
+	}
 
 	// 商品模块路由。
 	productRepo := product.NewRepository(dbConn)
@@ -121,7 +139,7 @@ func main() {
 
 	// 需要登录的接口组。
 	protected := r.Group("/")
-	protected.Use(userHandler.Auth)
+	protected.Use(authMiddleware)
 
 	// 购物车模块路由。
 	cartRepo := cart.NewRepository(dbConn)
@@ -217,10 +235,10 @@ func main() {
 	// /shop 的访问也和 /demo 一样不计入 metrics 的业务总请求，
 	// 免得用户开着页面就把压测口径搅浑（见 internal/pkg/metrics/middleware.go）。
 	//
-	// 注意第三个参数：把 user 模块的鉴权中间件传进去，只有 /shop/my（查我的订单）需要登录。
+	// 注意第三个参数：把上面那个统一的鉴权中间件传进去，只有 /shop/my（查我的订单）需要登录。
 	// 页面本身不挂鉴权——得先能打开页面，才谈得上在里面登录。
 	shopHandler := shop.NewHandler(productService, seckillService)
-	shop.RegisterRoutes(r, shopHandler, userHandler.Auth)
+	shop.RegisterRoutes(r, shopHandler, authMiddleware)
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
 	go func() {
@@ -297,7 +315,7 @@ func accessLog() gin.HandlerFunc {
 		cost := time.Since(start)
 
 		if c.Writer.Status() >= http.StatusBadRequest || cost >= slowThreshold {
-			log.Printf("[http] %s %s status=%d cost=%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), cost)
+			log.Printf("[http] %s %s status=%d cost=%s trace=%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), cost, trace.FromGin(c))
 		}
 	}
 }
