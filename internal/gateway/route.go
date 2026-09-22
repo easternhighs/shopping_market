@@ -55,6 +55,9 @@ var Routes = []Route{
 // 注意 /shop/my（我的订单）不在白名单里：它是 /shop 下面的私有接口，
 // 所以下面单独用一个 ProtectedPaths 把它摘出来。
 var PublicPaths = []string{
+	// 网关自己的健康检查接口。必须匿名可访问，否则验证流程第 1 步
+	// （打开 /healthz 应该看到 200）永远过不去。
+	"/healthz",
 	"/login",
 	"/register",
 	"/products",
@@ -74,24 +77,40 @@ var ProtectedPaths = []string{
 
 // MatchRoute 按最长前缀匹配，找出这个路径该归哪个服务。
 //
-// TODO(你来实现)：遍历 Routes，返回命中的那一条（第二个返回值 true）；一条都没命中就返回 false。
+// 为什么必须选「最长的那个前缀」：假如以后加了 {Prefix: "/products"} 和
+// {Prefix: "/products/export"} 两条，请求 /products/export/1 应该归后者管。
+// 如果「命中一个就返回」，结果就取决于「表里谁先写」——这种 bug 非常隐蔽，
+// 换个顺序就复现或者消失，排查起来能要人命。
 //
-// 关键点：必须选「最长的那个前缀」，不能「随便命中一个就返回」。
-// 举例说明为什么：假如以后加了 {Prefix: "/products"} 和 {Prefix: "/products/export"} 两条，
-// 请求 /products/export/1 应该归后者管。如果按表里的顺序返回第一个命中的，
-// 结果就取决于「表里谁先写」——这种 bug 非常隐蔽，换个顺序就复现或者消失。
+// 这里记一下踩过的两个坑：
+//  1. 写成 longerRoute.Prefix = path，把「请求的完整路径」存了进去，
+//     而不是「路由自己的前缀」，返回的路由是错的；
+//  2. 因为存的是完整路径，下一次比较就成了 len(path) > len(path)，
+//     永远为 false，整个函数退化成「第一条命中的赢」，最长前缀匹配名存实亡。
 //
-// 提示：用 strings.HasPrefix(path, route.Prefix) 判断命中；
-// 用一个变量记下「目前命中的最长前缀长度」和「对应的那条路由」，遍历完再返回。
+// 正确做法：拿 route.Prefix 的长度去比，命中就整条赋值过去。
 func MatchRoute(path string) (Route, bool) {
-	// TODO(你来实现)
-	_ = path
-	return Route{}, false
+	var matched Route
+	for _, route := range Routes {
+		if !strings.HasPrefix(path, route.Prefix) {
+			continue
+		}
+		// 比的是「路由前缀」有多长，不是请求路径有多长。
+		if len(route.Prefix) > len(matched.Prefix) {
+			matched = route
+		}
+	}
+
+	// matched 还是零值（Prefix 为空），说明一条都没命中。
+	if matched.Prefix == "" {
+		return Route{}, false
+	}
+	return matched, true
 }
 
 // IsPublic 判断某个路径是不是可以匿名访问。
 //
-// TODO(你来实现)：分两步判断，顺序不能反：
+// 分两步，顺序不能反：
 //  1. 先看 ProtectedPaths：命中就返回 false（私有，需要登录）；
 //  2. 再看 PublicPaths：命中就返回 true（公开）；
 //  3. 两边都没命中：返回 false（默认要登录）。
@@ -100,10 +119,27 @@ func MatchRoute(path string) (Route, bool) {
 // 新加了一个接口、忘了配白名单，最坏结果是「需要登录才能用」（用户抱怨一句）；
 // 反过来默认公开、忘了配，那就是「谁都能用」（安全事故）。
 //
-// 提示：两个名单都用 strings.HasPrefix 判断前缀。
+// 必须用 strings.HasPrefix 做【前缀】匹配，不能拿全等去比：
+// 白名单里写的是 "/shop"，而页面实际请求的是 "/shop/data"、"/shop/seckill"……
+// 全等比较的结果是只有一字不差的 "/shop" 能过，其它全被拦成 401，
+// 演示前台和控制台会整片打不开（之前用 slices.Contains 就踩过这个坑）。
 func IsPublic(path string) bool {
-	// TODO(你来实现)
-	_ = path
+	// 第一步：先查私有名单。顺序不能反——/shop 是公开的，但 /shop/my 是私有的，
+	// 反过来判的话 /shop/my 会先命中 /shop 被放行，等于把别人的订单列表公开了。
+	for _, p := range ProtectedPaths {
+		if strings.HasPrefix(path, p) {
+			return false
+		}
+	}
+
+	// 第二步：再查公开名单。
+	for _, p := range PublicPaths {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+
+	// 两边都没命中：默认要登录。
 	return false
 }
 

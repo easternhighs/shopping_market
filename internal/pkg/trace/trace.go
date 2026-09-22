@@ -23,6 +23,11 @@ package trace
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	mr "math/rand"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -39,22 +44,21 @@ const ginKey = "traceID"
 // 撞了之后两边互相覆盖，排查起来非常难受。
 type ctxKey struct{}
 
-// NewID 生成一个新的 trace id。
+// NewID 生成一个新的 trace id：取 16 个随机字节，用十六进制表示（32 个字符）。
 //
-// TODO(你来实现)：返回一个随机、几乎不可能重复的字符串。
-// 建议做法：取 16 个随机字节，用十六进制表示（32 个字符）。
-//
-// 提示：
-//   - 随机数用 crypto/rand，不要用 math/rand。math/rand 的序列是可预测的，
+// 两个刻意的选择：
+//   - 随机数用 crypto/rand，不用 math/rand。math/rand 的序列是可预测的，
 //     换个说法：两台机器在同一毫秒启动，可能生成一模一样的编号，那这次追踪就白做了。
-//   - 生成失败（实际上几乎不可能）时不要 panic。trace id 只是排查工具，
-//     不能因为它把正常的业务请求搞挂——退回一个「时间戳 + 一点随机」的字符串就够了。
-//   - 需要新 import 的包：crypto/rand、encoding/hex、time。
-func NewID() string {
-	// TODO(你来实现)：生成 16 字节随机数 → 转成十六进制字符串。
+//   - 生成失败时（实际上几乎不可能）不 panic，退回「时间戳 + 一点随机」。
+//     trace id 只是排查工具，不能因为它把正常的业务请求搞挂。
 
-	// 下面这行只是让函数先能编译通过，填完之后请删掉它。
-	return ""
+func NewID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().Unix()+int64(mr.Int()), 16)
+	}
+
+	return hex.EncodeToString(b)
 }
 
 // WithID 把编号放进 context，返回一个新的 context。
@@ -75,26 +79,42 @@ func FromGin(c *gin.Context) string {
 
 // Middleware 是给 Gin 用的追踪中间件。
 //
-// TODO(你来实现)：把下面这段注释里的步骤写成代码。
-//
-// 它要做四件事，顺序很重要：
+// 它做四件事，顺序很重要：
 //  1. 先看请求头 c.GetHeader(HeaderKey)：
 //     有值就沿用（说明上游已经生成过，同一个请求必须用同一个编号）；
-//     空字符串就说明这是链路的起点，调用 NewID() 新生成一个。
+//     空字符串才说明这是链路的起点，调用 NewID() 新生成一个。
 //  2. 把编号存进两个地方：
 //     c.Set(ginKey, id)  —— 给同一次请求里的其他中间件和 handler 用；
 //     c.Request = c.Request.WithContext(WithID(c.Request.Context(), id))
-//     —— 给那些只拿到 context 的函数用（比如接下来要去调下游服务的时候）。
+//     —— 给那些只拿到 context 的函数用（比如反向代理把请求转发给下游的时候）。
+//     第二个地方要注意传的是 c.Request.Context()，不是 c 本身：
+//     *gin.Context 碰巧也实现了 context.Context 接口（所以传 c 能编译过），
+//     但请求真正携带的 context 是 c.Request.Context()，语义上应该用它。
 //  3. c.Header(HeaderKey, id)：写回响应头，让调用方也能看到这次请求的编号。
 //     注意这一步必须在 c.Next() 之前做：响应头要在业务写响应体之前设好，
 //     等 c.Next() 回来再设，响应可能已经发出去了，设了也看不到。
 //  4. c.Next() 放行，让请求继续往后走。
 //
-// 一个容易踩的坑：这一步不是「一定要新生成」，而是「有就沿用、没有才生成」。
-// 如果无脑 NewID()，那链路每经过一跳就换一次编号，等于白做。
+// 一个踩过的坑：第 1 步不是「一定要新生成」，而是「有就沿用、没有才生成」。
+// 之前的写法是「先 if 判断赋值、紧接着又无条件 NewID()」，那个 if 等于白写，
+// 上游传进来的编号每次都被丢掉——链路每经过一跳就换一次编号，追踪就断了。
+
 func Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// TODO(你来实现)：四步写在这里。
+		// 1. 有就沿用、没有才生成（注意是 if/else，不能写成「先判断、再无条件赋值」）。
+		id := c.GetHeader(HeaderKey)
+		if id == "" {
+			id = NewID()
+		}
+
+		// 2. 存两处：Gin 上下文给 handler 和日志用，请求 context 给反向代理用。
+		c.Set(ginKey, id)
+		c.Request = c.Request.WithContext(WithID(c.Request.Context(), id))
+
+		// 3. 写回响应头，必须在 c.Next() 之前。
+		c.Header(HeaderKey, id)
+
+		// 4. 放行。
 
 		c.Next()
 	}

@@ -4,8 +4,22 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 13 进行中**（网关收口）。微服务设计讨论稿已写完，网关与 trace 的**骨架已落地**（`internal/gateway` + `internal/pkg/trace` + `cmd/gateway` + `make run-gateway`），按挖空规则留了 **6 处空**等你填。填完照着 `docs/build.md` 阶段 13 的六步验证流程走一遍就能收口。骨架现状：`gofmt` / `go vet` / `go build` 干净，`GET /healthz` 能通，其余 5 步要等空填完
-- 本次完成：**阶段 13 起步：写完微服务拆分讨论稿，并搭好「网关 + trace id」骨架（留 6 处空）**（阶段 13 进行中）
+- 当前阶段：**阶段 13 已完成**（网关收口）。微服务设计讨论稿已写完，网关与 trace 的骨架已落地（`internal/gateway` + `internal/pkg/trace` + `cmd/gateway` + `make run-gateway`），**6 处空已填完**，并修掉 5 处会让网关「整体不可用」的缺陷，六步验证流程全部走通。`gofmt` / `go vet` / `go build` 干净
+- 本次完成：**阶段 13 收口：填完 6 处空，并修掉 5 处让网关「整体不可用」的缺陷，六步验证全部走通**（阶段 13 已完成）
+  - 先说结论：六个空填完之后，网关照旧是**每个请求都失败**。原因是那 6 个空只是「业务逻辑」，而网关能不能跑起来还取决于一些**框架约定**——这些约定不在挖空的范围内，但错了整个网关就瘫痪。这一轮一共查出并修掉 5 个缺陷，其中缺陷 A 是最要命的，也是你这次指出的那一个
+  - **缺陷 A（关键）：`Director` 和 `Rewrite` 只能有一个。**`httputil.NewSingleHostReverseProxy()` 会**默认帮我们填一个 `Director`**；而按官方推荐改用 `Rewrite`（`Director` 已被标记「将来会被 `Rewrite` 取代」）之后，两个同时存在，`net/http/httputil` 直接拒绝工作，报：`ReverseProxy must have exactly one of Director or Rewrite set`。表现是**所有**请求都回 502「上游服务不可用」，但后端其实活得好好的——非常有误导性。修法是在 `internal/gateway/proxy.go` 里显式写一行 `proxy.Director = nil`（保留用户写的 `Rewrite` 写法）
+  - 缺陷 B：`IsPublic` 用 `slices.Contains` 做**全等**比较。白名单里写的是 `/shop`，而演示前台实际请求的是 `/shop/data`、`/shop/seckill`……全等的结果是只有一字不差的 `/shop` 能过，其它全是 401，演示前台和控制台整片打不开。改成 `strings.HasPrefix` 做**前缀**匹配（「先查私有名单、再查公开名单」的顺序保持不变）
+  - 缺陷 B2：`/healthz` 既不在 `Routes` 也不在 `PublicPaths`，按「默认要登录」的规则被拦成 401，验证流程第 1 步直接卡住。已把 `/healthz` 加进 `PublicPaths`
+  - 缺陷 C：`trace.Middleware` 里先写了个 `if` 判断请求头有没有编号，紧接着**又无条件** `id = NewID()`，那个 `if` 等于白写——上游传进来的编号每次都被丢掉，每经过一跳就换一次编号，链路追踪直接断掉。改成 `if id == "" { id = NewID() }`（有就沿用、没有才生成）
+  - 缺陷 D：`MatchRoute` 里把**请求的完整路径**存进了 `longerRoute.Prefix`（而不是路由自己的前缀），于是下一次比较退化成 `len(path) > len(path)`、永远为 false，「最长前缀匹配」名存实亡，实际变成「第一条命中的赢」。改成比较 `route.Prefix` 的长度、命中就整条赋值
+  - 缺陷 E1：`WithID(c, id)` 传的是 Gin 上下文。`*gin.Context` 碰巧也实现了 `context.Context` 接口所以**能编译过**，但请求真正携带的 context 是 `c.Request.Context()`，语义上应该用后者
+  - 缺陷 E2：鉴权失败原本用 `c.AbortWithStatus(401)`，返回空 body。和项目里其它地方（`internal/user/auth.go`）的风格不一致，改成 `c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的登录令牌"})`
+  - **顺带堵掉一个安全漏洞**：网关在公开路径上是**直接放行**的，如果不主动清掉客户端的 `X-User-Id`，客户端就能自己伪造一个 `X-User-Id: 15` 原样转发给下游。现在下游还不看这个头所以没出事，等阶段 14 拆完 user 服务、下游改成「无条件相信网关的头」，这就是一个能直接冒充别人的洞。已在 `Auth()` 的第 0 步加 `c.Request.Header.Del(HeaderUserID)`
+  - 另一个刻意的决定：**不调用 `req.SetXForwarded()`**。它会把 `X-Forwarded-For` 设成「客户端传来的值 + 真实 IP」，而下游取客户端 IP 用的是 `c.ClientIP()`（读 XFF 的第一段），客户端只要每次换一个 XFF 就能每次换一个限流桶、把限流绕过去。将来真要加，正确做法是「覆盖」而不是「追加」
+  - 实测（`server_s13.exe` :8080 + `gateway_s13.exe` :8081）：`/healthz` → **200**；未带 token 访问 `/me` → **401** 且是规范 JSON；`POST /login`（`demo1`/`demo1234`）→ 200 拿到顶层 `token`；带 token 走 `/me`、`/cart/items` → **200**；`/shop/data`、`/shop/seckill` → **200**（缺陷 B 的回归点）；`/shop/my` 不带 token → 401、带 token → 200（证明「先私有后公开」的顺序是对的）；带 `X-Trace-Id: my-fixed-id-123` 请求 `/healthz`，**响应头原样回同一个值**（缺陷 C 的回归点）；`GATEWAY_BACKEND=http://127.0.0.1:19999` → **502**，响应头和日志里都带同一条 trace id
+  - 额外验证（用一个临时的回显服务当上游）：确认网关**确实把 `X-Trace-Id` 转发给了下游**、客户端伪造的 `X-User-Id` **被摘掉**、`Path` **没有被改写**（`/shop/data` 原样到达上游）
+  - 说明：trace id 目前只是**从网关发给了下游**，下游（现在这个单体）还没接 `trace.Middleware`、日志里也还没打这个编号。这是阶段 14 拆服务时要补的（见 `docs/microservices.md` 的「trace id 全程透传」）
+- 上一轮完成：**阶段 13 起步：写完微服务拆分讨论稿，并搭好「网关 + trace id」骨架（留 6 处空）**（阶段 13 进行中）
   - 要解决的问题：前 12 个阶段功能和压测都做完了，但有一问一直没答上——「万一要拆微服务，你从哪儿下手？」。这一轮先把**设计想清楚**（写成文档），再把微服务的**第一块砖（网关）**立起来：网关负责四件事——哪个路径归哪个服务、谁需要登录、这次请求的编号是什么、请求转给谁。这四件事想明白了，以后把某个模块搬成独立进程就只是「换个上游地址」
   - 文档产出：新增 `docs/microservices.md`（272 行，讨论稿，不写代码只写决策）。内容包括：① 现状体检——9 个业务包、跨包依赖只有 4 条（`order→inventory`、`payment→order`、`shop→product,seckill`、`demo→user,product,inventory,seckill`）；② **关键发现：秒杀自带一套库存池**（`seckill_items.total_stock/sold` 独立于 `stocks` 表，秒杀链路全程不碰 `inventory.stocks`），所以秒杀模块数据自治、是最好拆的一块；③ 三处硬耦合（`internal/order/service.go:67` 那个共用的 `DeductWithDB(tx,...)`、`internal/demo/handler.go:76` 的 `/demo/seed` 一次写四类表、`internal/shop` 在服务端拼 product+seckill）；④ 目标拓扑（gateway / user / product+inventory / order+cart+payment / seckill 五块，各自独占哪些表）；⑤ **拆分必须补的 5 件事**（鉴权下沉到网关、秒杀热路径一跳都不能加、下单扣库存改成「RPC + 本地消息表 + 重试」并明确否决 2PC/TCC/Seata、幂等与跨服务对账、trace id 全程透传）；⑥ 阶段 13~17 的落地路线；⑦ 代价对照表（**特别写明：同机跑多进程会互抢 CPU，微服务 QPS 通常反而比单体低，要证明收益必须跑多机**）
   - 代码骨架（都是新文件，**没有动任何现有业务代码**）：
@@ -132,7 +146,7 @@
   - 实测：256 VU 压 20 秒，系统自己打出「`15:40:05` 突发流量（QPS 4705/s、门槛 500/s）」和「`15:40:27` 恢复（持续 22 秒、峰值 5257.7）」；5xx 峰值 0%、Kafka LAG 峰值 0、在途订单峰值 0；同一条件 A/B（观测前 112,631 请求 / p99 60.0ms，观测后 108,353 请求 / p99 65.18ms），**QPS 无可见下降**
   - 顺手修掉四个真实缺陷（都写进 `docs/interview.md` 了，是很好的面试素材）：① 告警文案和判据不一致（冷启动基线为 0 时报「越过门槛 0/s」）；② 4xx 拒绝率算出 100.43%（分子是「请求结束」、分母是「请求进来」，改了分母口径）；③ 恢复事件的峰值报的是最后一个窗口的瞬时值（586）而不是真实峰值（5257）；④ 报告里事件顺序倒置
 - 上一轮文档产出：`docs/benchmark.md` 新增「优化记录 8」（改动表、返回值约定、三个取舍、A/B 对比、CPU profile 结论、一致性复核、已知小风险）；`docs/architecture.md` 更新秒杀时序图（4 次往返 → 1 次 Lua）、三层防线、Redis Key 表（新增 `:window`、限流 key 改按用户）、pprof 开关、第 10 节瓶颈结论；`docs/interview.md` 新增「第 ⑤ 轮优化故事」、数据手册补新数据、重写 Q6（QPS 怎么冲上去的）和 Q8（限流为什么搬进 Lua）、更新不足清单；`docs/build.md` 的 6.1 标记完成并补实测结论
-- 下一步计划：**把阶段 13 的 6 个空填完并收口**（填 `internal/pkg/trace/trace.go` 的 `NewID`/`Middleware`、`internal/gateway/route.go` 的 `MatchRoute`/`IsPublic`、`internal/gateway/auth.go` 的 `Auth`、`internal/gateway/proxy.go` 的 `proxy.Director`），然后照 `docs/build.md` 阶段 13 的六步验证流程实跑一遍（`/healthz` → 未登录访问 `/me` 应 401 → `/login` 拿 token → 带 token 走 `/me` `/cart/items` `/shop` → 看 `X-Trace-Id` 响应头与访问日志 → 把 `GATEWAY_BACKEND` 指到错误端口看 502）。收口之后如果还想继续拆，下一步是**阶段 14：把 `internal/user` 拆成独立进程**，用 `GATEWAY_UPSTREAM_USER` 一个环境变量把 `/login` `/register` `/me` 挪过去
+- 下一步计划：阶段 13 已收口。如果继续往下拆，下一步是**阶段 14：把 `internal/user` 拆成独立进程**——新增 `cmd/user`，用 `GATEWAY_UPSTREAM_USER=http://127.0.0.1:8082` 一个环境变量把 `/login` `/register` `/me` 的流量从单体挪到新进程，网关代码和路由表都不用改；同时给下游补上 `trace.Middleware`，让 trace id 真正在日志里串起来。（微服务这部分目前只讨论到「怎么拆」，是否继续拆、拆几块，按需再定）
 - 更早两轮的结论（备查）：优化记录 6 用 k6 对照定位出「Gin 自带的逐请求访问日志」是第一个天花板（写文件 6,500/s vs 丢弃 55,000/s，差 9 倍），并用隔离基准量出「一次抢购 4 次 Redis 往返」的上限约 9,000/s；优化记录 7 在不动链路结构的前提下把峰值做到 5,907 QPS，并修掉对账超卖隐患
 ## 阶段进度
 
@@ -149,4 +163,4 @@
 - [x] 阶段 10：滑动窗口限流（ZSET 记放行时刻，抢购热路径与秒杀管理接口两处都改，A/B 实测证明边界放水消失）
 - [x] 阶段 11：面试演练与资料收口（k6 脚本进版本库、附录 A/B 补上超时关单与滑动窗口、照着脚本实跑验证）
 - [x] 阶段 12：购物车与结算页（/shop/cart 页面 + 商品页加购列；5 个前端函数与购物车越权校验均已实现并实测）
-- [ ] 阶段 13：网关收口（微服务讨论稿已写完；网关 + trace 骨架已落地，12 条路由 / 6 个服务，**6 处空待填**）
+- [x] 阶段 13：网关收口（微服务讨论稿已写完；网关 + trace 骨架已落地，12 条路由 / 6 个服务，6 处空已填完、5 处缺陷已修，六步验证走通）

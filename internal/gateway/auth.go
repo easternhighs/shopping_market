@@ -1,7 +1,13 @@
 package gateway
 
 import (
+	"net/http"
+	"strconv"
+	"strings"
+
 	"github.com/gin-gonic/gin"
+
+	"shopping_market/internal/pkg/jwt"
 )
 
 // HeaderUserID 是网关解析完令牌后，写给下游服务的「用户是谁」的头。
@@ -23,40 +29,55 @@ const HeaderUserID = "X-User-Id"
 // 区别只有一个：网关不把用户 ID 只放进自己的上下文，它还要【写进请求头】传给下游，
 // 让下游知道「这次请求是谁发的」。
 //
-// TODO(你来实现)：按下面 5 步把这个中间件写完。
+// 它按 5 步工作：
+//  0. 先删掉客户端自己传来的 X-User-Id（关键，见下面注释）；
+//  1. 白名单放行：页面、登录注册接口本来就允许匿名访问；
+//  2. 取 "Authorization: Bearer xxx" 里的令牌；
+//  3. 用 jwt.Parse 验签并拿到用户 ID；
+//  4. 把用户 ID 写进请求头 X-User-Id 传给下游，同时放进网关自己的上下文。
 //
-// 动手之前先在文件顶部补上这几个 import（现在只留了 gin，其他都靠你自己加）：
+// 第 0 步为什么必须做：网关是唯一有权写 X-User-Id 的地方，
+// 但公开路径（比如 /shop）是直接放行的，如果不主动删掉这个头，
+// 客户端就能自己伪造一个 X-User-Id: 15，让它原样转发给下游。
+// 现在下游还不看这个头所以没出事，等拆完 user 服务、下游改成
+// 「无条件相信网关的头」，这里就是一个能直接冒充别人的漏洞。
 //
-//		"net/http"                            401 状态码
-//		"strconv"                             把 userID 转成字符串
-//		"strings"                             处理 "Bearer " 前缀
-//		"shopping_market/internal/pkg/jwt"    解析令牌
-//
-//	 1. 白名单放行：如果 IsPublic(c.Request.URL.Path) 为 true，就 c.Next() 然后 return。
-//	    这一步必须放在最前面——页面、登录接口本来就允许匿名访问，
-//	    不放行的话用户连登录页都打不开，会出现「必须先登录才能登录」的笑话。
-//
-//	 2. 取令牌：authHeader := c.GetHeader("Authorization")，
-//	    判断是否以 "Bearer " 开头，不是就返回 401 + c.Abort()。
-//	    （可以直接抄 internal/user/auth.go，那段逻辑写得很清楚了。）
-//
-//	 3. 解析令牌：jwt.Parse(token) 拿到 userID；出错同样返回 401 + c.Abort()。
-//
-//	 4. 把用户 ID 传给下游，两个地方都要写：
-//	    c.Request.Header.Set(HeaderUserID, strconv.FormatUint(uint64(userID), 10))
-//	    —— 这一步是关键：请求头会随着反向代理一起转发给下游服务；
-//	    c.Set("userID", userID)
-//	    —— 网关自己如果需要用到（比如日志），也能从上下文里拿。
-//	    strconv 需要新 import。
-//
-//	 5. c.Next() 放行。
-//
-// 注意返回错误的写法：c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的登录令牌"})
-// 一定要带 Abort，否则后面的 handler 还会照常执行——鉴权失败却继续干活，等于没鉴权。
+// 返回错误一律用 c.AbortWithStatusJSON（不是 c.JSON），
+// 否则后面的 handler 还会照常执行——鉴权失败却继续干活，等于没鉴权。
 func Auth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// TODO(你来实现)：5 步写在这里。
+		// 0. 先删掉客户端伪造的 X-User-Id（理由见函数上方的说明）。
+		c.Request.Header.Del(HeaderUserID)
 
+		// 1. 白名单放行。这一步必须放在最前面——页面、登录接口本来就允许匿名访问，
+		//    不放行的话用户连登录页都打不开，会出现「必须先登录才能登录」的笑话。
+		if IsPublic(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
+		// 2. 取令牌：必须是 "Authorization: Bearer xxx" 的形式。
+		authHeader := c.GetHeader("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的登录令牌"})
+			return
+		}
+
+		// 3. 解析令牌，拿到用户 ID。
+		userID, err := jwt.Parse(strings.TrimPrefix(authHeader, "Bearer "))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的登录令牌"})
+			return
+		}
+
+		// 4. 把用户 ID 传给下游，两个地方都要写：
+		//    请求头会随着反向代理一起转发给下游服务；
+		//    网关自己（比如日志）也能从上下文里拿。
+		//    jwt.Parse 返回的是 uint，所以用 FormatUint。
+		c.Request.Header.Set(HeaderUserID, strconv.FormatUint(uint64(userID), 10))
+		c.Set("userID", userID)
+
+		// 5. 放行。
 		c.Next()
 	}
 }

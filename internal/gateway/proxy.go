@@ -77,30 +77,32 @@ func (p *Proxy) Handler() gin.HandlerFunc {
 
 // newReverseProxy 构造一个指向 target 的反向代理。
 //
-// TODO(你来实现)：把 proxy.Director 填完。它是「改写请求」的地方，
-// 每个请求在转发出去之前都会经过它。按下面 4 步做：
+// 改写请求用的是 Rewrite，不是 Director：
+//   - Director 已被官方标记为「将来会被 Rewrite 取代」，Go 1.20 起推荐用 Rewrite；
+//   - Rewrite 的入参是 httputil.ProxyRequest，它把「进来的请求(In)」和
+//     「要发出去的请求(Out)」分得很清楚，不像 Director 那样直接在原请求上改；
+//   - 附带好处：用 Rewrite 时反向代理会先替我们删掉客户端自己传的
+//     Forwarded / X-Forwarded-* 头，伪造来源这件事默认就被堵住了。
 //
-//  1. 改写目标地址（只改 Scheme 和 Host，不要动 Path 和 Query）：
-//     req.URL.Scheme = u.Scheme
-//     req.URL.Host = u.Host
-//     req.Host = u.Host
-//     为什么不能动 Path：/cart/items/3 这条路径是下游路由用来匹配的，
-//     改了它，下游就找不到对应的接口了。我们只是换了「发往哪台机器」，不是换接口。
+// 改写分 4 步（都写在下面的 Rewrite 里）：
 //
-//  2. 删掉 hopByHopHeaders 里的头（用 req.Header.Del(名字) 挨个删）。
+//  1. 改目标地址：只改 Scheme 和 Host，**不动 Path 和 Query**。
+//     为什么不能动 Path：/cart/items/3 是下游用来匹配路由的，改了它下游就找不到
+//     对应接口了——我们只是换「发往哪台机器」，不是换接口。
 //
-//  3. 把追踪编号带过去：
-//     if id := trace.FromContext(req.Context()); id != "" { req.Header.Set(trace.HeaderKey, id) }
-//     说明：网关的 trace 中间件已经把编号放进了请求的 context，
-//     这里取出来显式塞进转发请求的头里，下游就能接到同一个编号。
+//  2. 删掉 hopByHopHeaders 里的头。这些头只对「当前这一跳」有意义
+//     （比如 Connection: keep-alive 是说「我和网关这条连接要复用」），
+//     原样转给下游语义就串了，所以必须摘干净。
 //
-//  4. 不要覆盖 HeaderUserID。
-//     这个头是网关的鉴权中间件加上去的，转发时会自动带过去；
-//     你在 Director 里什么都不做，它就已经在下游的请求里了——
-//     但正因如此，**下游绝不能信任来自外网的 X-User-Id**，只信任网关加的那个。
+//  3. 把 trace id 带过去：网关的 trace 中间件已经把编号放进了请求的 context，
+//     这里取出来显式塞进转发请求的头里，下游才能接着用同一个编号打日志。
+//     注意取的是 req.In.Context()，也就是「进来的那个请求」的 context。
 //
-// 另外注意：Director 里不能调用 c（Gin 的上下文），因为这里只有标准的
-// *http.Request。所以我们需要的东西（比如 trace id）必须提前放进请求的 context 里，
+//  4. 不动 X-User-Id：它是网关的鉴权中间件刚加上去的，而 Out 是 In 的克隆，
+//     会自动带过去，这里什么都不用做。
+//
+// 同样注意：Rewrite 里不能调用 c（Gin 的上下文），这里只有标准的 *http.Request。
+// 所以需要的东西（比如 trace id）必须提前放进请求的 context 里，
 // 这正是 trace 中间件要同时写 context 和 Gin 上下文两个地方的原因。
 func newReverseProxy(target string) (*httputil.ReverseProxy, error) {
 	u, err := url.Parse(target)
@@ -110,8 +112,41 @@ func newReverseProxy(target string) (*httputil.ReverseProxy, error) {
 
 	proxy := httputil.NewSingleHostReverseProxy(u)
 
-	proxy.Director = func(req *http.Request) {
-		// TODO(你来实现)：4 步写在这里。
+	// 关键的一行：NewSingleHostReverseProxy 默认会帮我们填一个 Director，
+	// 而 ReverseProxy 要求 Director 和 Rewrite 【只能有一个】。
+	// 两个都在，每个请求都会直接失败：
+	//   ReverseProxy must have exactly one of Director or Rewrite set
+	// 表现就是所有请求都回 502「上游服务不可用」，而后端其实是好的。
+	// 既然改用 Rewrite，就必须把默认的 Director 清掉。
+	proxy.Director = nil
+
+	// Rewrite 在每个请求转发出去之前执行，是「改写请求」的地方。
+	proxy.Rewrite = func(req *httputil.ProxyRequest) {
+		// 1. 改目标地址：只改 Scheme / Host，Path 和 Query 原样保留。
+		req.Out.URL.Scheme = u.Scheme
+		req.Out.URL.Host = u.Host
+		req.Out.Host = u.Host
+
+		// 2. 摘掉 hop-by-hop 头，它们只对当前这一跳有意义。
+		for _, key := range hopByHopHeaders {
+			req.Out.Header.Del(key)
+		}
+
+		// 3. 透传 trace id，下游就能用同一个编号打日志。
+		if id := trace.FromContext(req.In.Context()); id != "" {
+			req.Out.Header.Set(trace.HeaderKey, id)
+		}
+
+		// 4. 这里刻意不调用 req.SetXForwarded()。
+		//    它会把 X-Forwarded-For 设成「客户端传来的值 + 真实 IP」，
+		//    而下游取客户端 IP 用的是 c.ClientIP()，它读的是 XFF 的第一段。
+		//    客户端只要每次换一个 XFF，就能每次都换一个限流桶，把限流绕过去。
+		//    本项目的下游（也就是现在这个单体）不需要知道真实客户端 IP，
+		//    所以干脆不加这个头。将来真要加，正确做法是「覆盖」而不是「追加」：
+		//      req.Out.Header.Set("X-Forwarded-For", 真实客户端 IP)
+		//
+		//    X-User-Id 同理不在这里处理：Out 是 In 的克隆，
+		//    鉴权中间件刚写进去的那个头会自动带过去。
 	}
 
 	// ErrorHandler 已经写好：上游连不上（服务没起来、端口写错、网络不通）时，

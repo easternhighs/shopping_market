@@ -723,7 +723,7 @@ shopping_market/
   - 重复支付被拒：`POST /orders/11/pay` 第二次返回 400「订单状态不允许该操作」。
 - 完成标志：上面这些用例全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。**已达成。**
 
-### 阶段 13：网关收口（骨架已就绪，留 6 处空待填）
+### 阶段 13：网关收口（已完成）
 
 - 为什么做这一章：前 12 个阶段把功能和压测都做完了，但一直有一个问题没回答——
   「**万一将来要拆微服务，你从哪儿下手？**」。这一章的答案是：先把**网关**立起来。
@@ -742,31 +742,43 @@ shopping_market/
 
   | 文件 | 作用 | 状态 |
   | --- | --- | --- |
-  | `internal/pkg/trace/trace.go` | 请求编号（trace id）：生成、塞进上下文、读写 HTTP 头 | 2 处空 |
+  | `internal/pkg/trace/trace.go` | 请求编号（trace id）：生成、塞进上下文、读写 HTTP 头 | 完整 |
   | `internal/gateway/doc.go` | 包注释：网关管哪四件事、为什么做成旁路 | 完整 |
-  | `internal/gateway/route.go` | 路由表（12 条路径前缀 → 6 个服务）、白名单、最长前缀匹配 | 2 处空 |
-  | `internal/gateway/auth.go` | 网关统一验 JWT，把用户 id 塞进 `X-User-Id` 头给下游 | 1 处空 |
-  | `internal/gateway/proxy.go` | 反向代理：按路由表把请求转给对应服务的上游地址 | 1 处空 |
+  | `internal/gateway/route.go` | 路由表（12 条路径前缀 → 6 个服务）、白名单、最长前缀匹配 | 完整 |
+  | `internal/gateway/auth.go` | 网关统一验 JWT，把用户 id 塞进 `X-User-Id` 头给下游 | 完整 |
+  | `internal/gateway/proxy.go` | 反向代理：按路由表把请求转给对应服务的上游地址 | 完整 |
   | `cmd/gateway/main.go` | 网关进程入口（`GATEWAY_ADDR` / `GATEWAY_BACKEND` / `GET /healthz`） | 完整 |
   | `Makefile` | 新增 `make run-gateway` / `make build-gateway` | 完整 |
 
-- **留给你填的 6 个空**（每个空的上方都有一段注释讲清思路和坑）：
+- **6 处空已填完**（每个空的上方都有一段注释讲清思路和坑）。填的内容与验收点：
 
-  | # | 文件 | 函数 | 要做什么 |
-  | --- | --- | --- | --- |
-  | 1 | `internal/pkg/trace/trace.go` | `NewID()` | 生成一个随机唯一串：`crypto/rand` 取 16 字节 → 十六进制编码；取随机数失败时退回「时间戳 + 随机数」，**不要 panic** |
-  | 2 | `internal/pkg/trace/trace.go` | `Middleware()` | 四步：沿用请求头里的编号或新生成 → 存进 gin 上下文和请求 Context → 写回响应头 → `c.Next()` |
-  | 3 | `internal/gateway/route.go` | `MatchRoute(path)` | 遍历 `Routes` 做**最长前缀匹配**，返回命中的路由；一条都没命中返回 `false` |
-  | 4 | `internal/gateway/route.go` | `IsPublic(path)` | 先查 `ProtectedPaths`（命中返回 false）再查 `PublicPaths`（命中返回 true），两边都没有默认 false |
-  | 5 | `internal/gateway/auth.go` | `Auth()` | 五步：白名单放行 → 取 `Authorization: Bearer <token>` → `jwt.Parse` 验签 → 把用户 id 写进 `X-User-Id` 请求头 → `c.Next()`；失败必须 `c.Abort()` |
-  | 6 | `internal/gateway/proxy.go` | `proxy.Director` | 四步：改 `Scheme` / `Host` / `req.Host`（**不动 Path 和 Query**）→ 删 hop-by-hop 头 → 透传 trace id → 不覆盖已有的 `X-User-Id` |
+  | # | 文件 | 函数 | 做了什么 | 验收点 |
+  | --- | --- | --- | --- | --- |
+  | 1 | `internal/pkg/trace/trace.go` | `NewID()` | `crypto/rand` 取 16 字节 → 十六进制编码；取随机数失败退回「时间戳 + 随机数」，不 panic | 响应头 `X-Trace-Id` 是 32 位十六进制 |
+  | 2 | `internal/pkg/trace/trace.go` | `Middleware()` | 沿用请求头里的编号（没有才新生成）→ 存进 gin 上下文和请求 Context → 写回响应头 → `c.Next()` | 手动传 `X-Trace-Id` 请求，响应头回同一个值 |
+  | 3 | `internal/gateway/route.go` | `MatchRoute(path)` | 遍历 `Routes` 做**最长前缀匹配**，命中就整条赋值；一条不中返回 `false` | `/cart/items` 与 `/cart/items/1` 都归 order（最长前缀生效） |
+  | 4 | `internal/gateway/route.go` | `IsPublic(path)` | 先查 `ProtectedPaths`（命中返回 false）再查 `PublicPaths`（命中返回 true），两边都没有默认 false；用 `strings.HasPrefix` 做前缀匹配 | `/shop/data` 公开、`/shop/my` 私有 |
+  | 5 | `internal/gateway/auth.go` | `Auth()` | 第 0 步清客户端伪造的 `X-User-Id` → 白名单放行 → 取 `Authorization: Bearer <token>` → `jwt.Parse` 验签 → 把用户 id 写进 `X-User-Id` 请求头 → `c.Next()`；失败用 `AbortWithStatusJSON` | 不带 token 访问 `/me` 回 401 |
+  | 6 | `internal/gateway/proxy.go` | `Rewrite` | 四步：改 `Scheme` / `Host` / `Out.Host`（**不动 Path 和 Query**）→ 删 hop-by-hop 头 → 透传 trace id → 不动 `X-User-Id`（`Out` 是 `In` 的克隆，自动带过去） | 转发成功，下游收到 `X-Trace-Id` |
 
-  其中第 3、4 个空最容易写错，注释里专门解释了为什么：
-  - 第 3 个：**不能「命中就返回」**。必须记住目前命中的最长前缀。
-    否则将来加了 `/products` 和 `/products/export` 两条，`/products/export/1` 归谁管就取决于「表里谁先写」——
-    这种 bug 换个顺序就复现或消失，非常难查。
-  - 第 4 个：**顺序不能反**。`/shop` 是公开前缀，但 `/shop/my`（我的订单）是私有的，
-    所以必须**先**查私有名单。反过来的话 `/shop/my` 会先命中 `/shop` 被放行，等于把别人的订单列表公开了。
+- **填完之后又修掉的 5 个缺陷**（都是「不在挖空范围内、但错了整个网关就不可用」的坑）：
+
+  | # | 缺陷 | 位置 | 症状 | 修法 |
+  | --- | --- | --- | --- | --- |
+  | A | `Director` 和 `Rewrite` 同时存在 | `internal/gateway/proxy.go` | **所有**请求都 502（后端其实是好的），日志报 `ReverseProxy must have exactly one of Director or Rewrite set` | 显式加 `proxy.Director = nil`。`NewSingleHostReverseProxy` 会默认填一个 `Director`，改用 `Rewrite` 就必须清掉 |
+  | B | 白名单用全等比较 | `internal/gateway/route.go` | `/shop/data`、`/shop/seckill` 等一律 401，演示前台和控制台整片打不开 | `slices.Contains` → `strings.HasPrefix` 前缀匹配 |
+  | B2 | `/healthz` 不在任何名单 | `internal/gateway/route.go` | 按「默认要登录」被拦成 401，验证第 1 步就卡住 | 把 `/healthz` 加进 `PublicPaths` |
+  | C | trace id 沿用逻辑是死代码 | `internal/pkg/trace/trace.go` | 上游传的编号每次被丢掉，每跳换一次编号，链路追踪断开 | 改成 `if id == "" { id = NewID() }` |
+  | D | 最长前缀匹配拿完整路径去比 | `internal/gateway/route.go` | 比较退化成 `len(path) > len(path)`、永远 false，「最长前缀」名存实亡 | 比较 `route.Prefix` 的长度，命中就整条赋值 |
+  | E | 两处小问题 | `trace.go` / `auth.go` | ① `WithID(c, ...)` 传的是 Gin 上下文（能编译但语义错，请求真正的 context 是 `c.Request.Context()`）；② 鉴权失败用 `AbortWithStatus(401)` 返回空 body | ① 改传 `c.Request.Context()`；② 改 `AbortWithStatusJSON(401, gin.H{"error": "无效的登录令牌"})` |
+
+  顺带堵掉一个安全漏洞：网关在公开路径上是直接放行的，如果不主动清掉客户端的 `X-User-Id`，客户端就能伪造它原样转发给下游。现在下游还不看这个头所以没出事，等阶段 14 下游改成「无条件相信网关的头」，这就是能冒充别人的洞。已在 `Auth()` 第 0 步加 `Header.Del`。
+
+  另一个刻意的决定：**不调用 `req.SetXForwarded()`**——下游用 `c.ClientIP()` 读 `X-Forwarded-For` 的第一段，而 `SetXForwarded()` 是「追加」，客户端每次换一个 XFF 就能换一个限流桶、把限流绕过去。将来真要加，正确做法是覆盖而不是追加。
+
+- 第 3、4 个空为什么最容易写错（注释里也写了）：
+  - 第 3 个：**不能「命中就返回」**，必须记住目前命中的最长前缀。否则将来加了 `/products` 和 `/products/export` 两条，`/products/export/1` 归谁管就取决于「表里谁先写」——这种 bug 换个顺序就复现或消失，非常难查。
+  - 第 4 个：**顺序不能反**。`/shop` 是公开前缀，但 `/shop/my`（我的订单）是私有的，所以必须**先**查私有名单。反过来的话 `/shop/my` 会先命中 `/shop` 被放行，等于把别人的订单列表公开了。
 
 - 启动方式：
 
@@ -784,7 +796,7 @@ shopping_market/
   | `GATEWAY_BACKEND` | `http://127.0.0.1:8080` | 默认上游（也就是现在这个单体） |
   | `GATEWAY_UPSTREAM_<服务名大写>` | 空 | 给某个服务单独指定上游，例如 `GATEWAY_UPSTREAM_USER=http://127.0.0.1:8082`（阶段 14 拆 user 时就用它） |
 
-- 六步验证流程（填完空之后按顺序走一遍）：
+- 六步验证流程（按顺序走一遍）：
 
   1. **健康检查**：浏览器或 curl 打开 `http://127.0.0.1:8081/healthz`，应该返回 `200`，
      内容里有 `status: "ok"` 和一张「6 个服务 → 上游地址」的映射表。
@@ -802,8 +814,14 @@ shopping_market/
      这一步是确认「上游挂了网关不会崩，而且能顺着 trace id 找到原因」。
 
 - 完成标志：上面 6 步全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
-  （骨架阶段的现状：`gofmt` / `vet` / `build` 已经干净，但 6 步验证里只有第 1 步能过——
-  因为 6 个空都还没填。这正是「挖空」的正常状态。）
+- 收口实测（`server_s13.exe` :8080 + `gateway_s13.exe` :8081，两个进程各自写日志文件）：六步**全部通过**——
+  `/healthz` **200**；未带 token 的 `/me` **401**（规范 JSON）；`POST /login`（`demo1`/`demo1234`）**200** 拿到顶层 `token`；
+  带 token 的 `/me`、`/cart/items` **200**；`/shop/data` 与 `/shop/seckill` **200**（缺陷 B 的回归点）；
+  `/shop/my` 不带 token **401** / 带 token **200**（「先私有后公开」顺序的回归点）；
+  带 `X-Trace-Id: my-fixed-id-123` 的 `/healthz`，响应头**原样回同一个值**（缺陷 C 的回归点）；
+  `GATEWAY_BACKEND=http://127.0.0.1:19999` 时回 **502**，响应头和日志里都带同一条 trace id。
+  另外用一个临时回显服务当上游，确认了「`X-Trace-Id` 确实转发给了下游」「客户端伪造的 `X-User-Id` 被摘掉」「`Path` 没有被改写」。
+- 遗留（阶段 14 补）：trace id 目前只是**从网关发给了下游**，下游（现在这个单体）还没接 `trace.Middleware`、日志里也还没打这个编号。
 
 ## 8. 挖空式协作规则
 
