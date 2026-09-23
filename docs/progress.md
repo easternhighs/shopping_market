@@ -4,8 +4,18 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 14 进行中**（拆 user-service）。`cmd/user` 入口、两种模式的鉴权中间件、单体的 `USER_MODULE` 开关都已搭好，**2 处空留给你填**（都在 `internal/user/auth.go`）；`gofmt` / `go vet` / `go build` 干净
-- 本次完成：**阶段 14 起步：把用户模块搬成独立进程的骨架搭好（留 2 处空）**（阶段 14 进行中）
+- 当前阶段：**阶段 14 已完成**（拆 user-service）。用户模块已经能独立跑在 `:8082`，网关把 `/login` `/register` `/me` 转过去；八步验证全部走通。下一步是阶段 15（拆 seckill，**需要复测 1 万 QPS**）
+- 本次完成：**阶段 14 收口：填完 2 处空、修掉 3 个缺陷，八步验证全部走通**（阶段 14 已完成）
+  - 用户把 `internal/user/auth.go` 的 2 处空填完后，代码能编能跑，但八步验证的第 5 步没过（带 token 走网关访问 `/me` 返回 401）。逐个做对照实验后抓出 3 个缺陷，都已修掉
+  - **缺陷 1：存进上下文的是 `uint64`，下游按 `uint` 取 → 取不到。** `strconv.ParseUint` 返回 `uint64`，而下游 `Me` 用的是 `v.(uint)`、`/shop/my` 用的是 `c.GetUint`，gin v1.12 里这两者都是**严格类型断言**：`/me` 直接 401「登录状态无效」；`GetUint` 更危险——它**安静地返回 0**，接口会以「用户 0」的身份返回 200。对照实验：同一个 handler，8082 直连只带 JWT（存 `uint`）→ 200，只带 `X-User-Id`（存 `uint64`）→ 401。修法：`c.Set(contextUserID, uint(parsed))`
+  - **缺陷 2：第 1 段 `c.Next()` 后面漏了 `return`，响应体被拼成非法 JSON。** gin 里 `c.Next()` 执行完还会回到中间件继续往下走，于是又进了第 2 段。实测响应体变成 `{"error":"登录状态无效"}{"error":"无效的登录令牌"}`——两个 JSON 拼在一起。如果第 1 段的 handler 返回的是 200，第二个 JSON 会被**追加到 200 的响应体后面**（状态码已经发出去了，gin 只在日志里打一行 WARNING），前端 `JSON.parse` 直接失败。走网关时之所以没暴露，只是因为网关会把 `Authorization` 一起转发、第 2 段验签居然成功了——**是运气，不是正确性**。修法：`c.Next()` 之后加 `return`
+  - **缺陷 3：第 2 段少了 `Bearer ` 前缀检查。** `strings.TrimPrefix` 匹配不上时会原样返回整个字符串，于是 `Authorization: <裸令牌>` 也被接受了（实测 200，而文档要求 401）。修法：先 `if !strings.HasPrefix(authHeader, "Bearer ") { 401 }` 再 `TrimPrefix`
+  - 这三个缺陷有个共同点：**都不让程序崩，只让「结果悄悄不对」**（多余的 JSON 被追加、用户 ID 变成 0、裸令牌被放行）。所以每加一层鉴权或转发，都要用「正常 + 畸形 + 缺字段」三类输入各打一遍，光看「服务还活着」发现不了这类问题
+  - 顺带查清的一件事：两个入口的 `accessLog` 都是**只记录异常**的（`status >= 400` 或耗时 ≥ 500ms 才打一行），所以验证 trace 必须挑一个**会报错**的请求；而且这些日志走 **stderr**，重定向启动时落在 `.err` 文件、`.log` 里只有 Gin 的启动横幅。第一次验证时一度以为「trace 断了」，查清后已写进 `docs/build.md` 第 8 步
+  - 填充后实测：`trust_header=true`；直连 8080 `/me` → 404；走网关 `POST /login` → 200 + token；带 token 走网关访问 `/me`、`/cart/items`、`/shop/my`、`/orders/1` → 全部 200；伪造 `X-User-Id: abc` 直连 8082 → 401；只带合法 `X-User-Id: 15` 直连 8082 → 200 且响应体是**一个**合法 JSON；裸令牌 → 401；不带凭证 → 401。另外 10 组 `TRUST_USER_ID_HEADER` 边界值（`1`/`true`/`TRUE`/` true `/` 1 ` → 开；`flase`/`0`/`yes`/`on`/未设置 → 关）全部符合要求
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净
+  - 文档同步：`docs/build.md` 阶段 14 标记完成，补上填充后实测与 3 个缺陷的记录，并修掉第 6 步的笔误（`GET /orders` 这个路径其实不存在，只有 `POST /orders` 和 `GET /orders/:id`）
+- 上一轮完成：**阶段 14 起步：把用户模块搬成独立进程的骨架搭好（留 2 处空）**（当时阶段 14 进行中）
   - 要解决的问题：阶段 13 的网关只是「把请求转给同一个单体」，等于门立起来了、屋里还是同一间房。这一轮开始**真的把模块搬出去**，第一个挑 `internal/user`——它最小（只读一张 `users` 表）、和秒杀热路径无关，而且它是「鉴权」的源头，搬走之后「网关验一次、下游信头部」这条设计才真正落地
   - 关键词是「搬家，不是重写」：`internal/user` 的 `service.go` / `repository.go` / `model.go` **一行没改**，只做三件事：① 新增 `cmd/user`（默认 `:8082`）把它单独跑起来；② 把「用哪个鉴权中间件」从模块内部挪到调用方决定——`RegisterRoutes` 现在多收一个 `auth gin.HandlerFunc` 参数（和 `internal/shop/router.go` 一个风格，模块不用再关心自己跑在哪儿）；③ 给下游补上 `trace.Middleware()`，把阶段 13 遗留的「编号传下来了但下游没人接」补完（单体入口也一起补了，`accessLog` 现在会打出 trace id）
   - 鉴权中间件 `AuthMiddleware(trustHeader)` 有**两种模式**：`trustHeader=true` 时优先采用网关注入的 `X-User-Id`（省一次验签），头里没值才回退验 JWT；`false` 时永远验 JWT。`trustHeader` 由 `TrustHeaderFromEnv()` 决定，环境变量 `TRUST_USER_ID_HEADER` **默认关**——一旦打开，请求头里写你是谁你就是谁，只有「明确知道自己在内网、前面有网关」时才该开
@@ -14,7 +24,7 @@
   - 已做的验证（骨架级，2 处空尚未填）：`gofmt -l cmd internal` 无输出、`go vet ./...` 与 `go build ./...` 全部通过；三个进程（8080 / 8081 / 8082）都能起来；直连 8080 的 `/me` → 404（`USER_MODULE=0` 生效，用户路由确实搬走了）；走网关 `POST /login` → 200 + token（证明请求真的转到了 8082）；带 token 访问 `/me` 和 `/cart/items` → 401「鉴权中间件还没实现」（空 2 未填）；同一个 trace id 在网关日志与下游日志里各命中 1 行（阶段 13 遗留的「下游接 trace」已收尾）
   - 顺带发现并修掉一个「留空期」的坑：如果鉴权中间件的占位实现写成 `c.Next()` 直接放行，下游 handler 的 `c.GetUint(contextUserID)` 在上下文里没有用户 ID 时会**安静地返回 0**，于是 `/cart/items` 这类接口会以「用户 0」的身份返回 200——页面看起来正常、实际上谁都能进。所以占位实现改成直接 `AbortWithStatusJSON(401)`：宁可暂时不可用，也不要静默降级
   - 下一步：把这 2 处空填完 → 检查 + 跑八步验证（含「带 token 走网关访问 `/me` 和 `/cart/items` 都 200」「伪造 `X-User-Id: abc` 直连 8082 回 401」）→ 通过后提交 git
-- 上一轮完成：**阶段 13 收口：填完 6 处空，并修掉 5 处让网关「整体不可用」的缺陷，六步验证全部走通**（阶段 13 已完成）
+- 再上一轮完成：**阶段 13 收口：填完 6 处空，并修掉 5 处让网关「整体不可用」的缺陷，六步验证全部走通**（阶段 13 已完成）
   - 先说结论：六个空填完之后，网关照旧是**每个请求都失败**。原因是那 6 个空只是「业务逻辑」，而网关能不能跑起来还取决于一些**框架约定**——这些约定不在挖空的范围内，但错了整个网关就瘫痪。这一轮一共查出并修掉 5 个缺陷，其中缺陷 A 是最要命的，也是你这次指出的那一个
   - **缺陷 A（关键）：`Director` 和 `Rewrite` 只能有一个。**`httputil.NewSingleHostReverseProxy()` 会**默认帮我们填一个 `Director`**；而按官方推荐改用 `Rewrite`（`Director` 已被标记「将来会被 `Rewrite` 取代」）之后，两个同时存在，`net/http/httputil` 直接拒绝工作，报：`ReverseProxy must have exactly one of Director or Rewrite set`。表现是**所有**请求都回 502「上游服务不可用」，但后端其实活得好好的——非常有误导性。修法是在 `internal/gateway/proxy.go` 里显式写一行 `proxy.Director = nil`（保留用户写的 `Rewrite` 写法）
   - 缺陷 B：`IsPublic` 用 `slices.Contains` 做**全等**比较。白名单里写的是 `/shop`，而演示前台实际请求的是 `/shop/data`、`/shop/seckill`……全等的结果是只有一字不差的 `/shop` 能过，其它全是 401，演示前台和控制台整片打不开。改成 `strings.HasPrefix` 做**前缀**匹配（「先查私有名单、再查公开名单」的顺序保持不变）
@@ -154,8 +164,7 @@
   - 演示页新增第 ⑤ 区块「系统自己报异常」：每 2 秒轮询 `/metrics/alerts`，显示告警横幅、每条规则的当前值/门槛/平时基线、最近 5 条事件；事件文本用 `textContent` 逐条写，不走 `innerHTML`
   - 实测：256 VU 压 20 秒，系统自己打出「`15:40:05` 突发流量（QPS 4705/s、门槛 500/s）」和「`15:40:27` 恢复（持续 22 秒、峰值 5257.7）」；5xx 峰值 0%、Kafka LAG 峰值 0、在途订单峰值 0；同一条件 A/B（观测前 112,631 请求 / p99 60.0ms，观测后 108,353 请求 / p99 65.18ms），**QPS 无可见下降**
   - 顺手修掉四个真实缺陷（都写进 `docs/interview.md` 了，是很好的面试素材）：① 告警文案和判据不一致（冷启动基线为 0 时报「越过门槛 0/s」）；② 4xx 拒绝率算出 100.43%（分子是「请求结束」、分母是「请求进来」，改了分母口径）；③ 恢复事件的峰值报的是最后一个窗口的瞬时值（586）而不是真实峰值（5257）；④ 报告里事件顺序倒置
-- 上一轮文档产出：`docs/benchmark.md` 新增「优化记录 8」（改动表、返回值约定、三个取舍、A/B 对比、CPU profile 结论、一致性复核、已知小风险）；`docs/architecture.md` 更新秒杀时序图（4 次往返 → 1 次 Lua）、三层防线、Redis Key 表（新增 `:window`、限流 key 改按用户）、pprof 开关、第 10 节瓶颈结论；`docs/interview.md` 新增「第 ⑤ 轮优化故事」、数据手册补新数据、重写 Q6（QPS 怎么冲上去的）和 Q8（限流为什么搬进 Lua）、更新不足清单；`docs/build.md` 的 6.1 标记完成并补实测结论
-- 下一步计划：把 `internal/user/auth.go` 里的 2 处空填完（`TrustHeaderFromEnv` 和 `AuthMiddleware`），然后按 `docs/build.md` 阶段 14 的八步验证跑一遍：先直连 8082 看 `/healthz` 的 `trust_header` → 再直连 8080 确认 `/me` 已 404 → 再走网关登录、带 token 访问 `/me` 与 `/cart/items` → 最后伪造 `X-User-Id` 验证 401。验证通过后提交 git，再考虑阶段 15（拆 seckill，需要复测 1 万 QPS）
+- 再上一轮文档产出：`docs/benchmark.md` 新增「优化记录 8」（改动表、返回值约定、三个取舍、A/B 对比、CPU profile 结论、一致性复核、已知小风险）；`docs/architecture.md` 更新秒杀时序图（4 次往返 → 1 次 Lua）、三层防线、Redis Key 表（新增 `:window`、限流 key 改按用户）、pprof 开关、第 10 节瓶颈结论；`docs/interview.md` 新增「第 ⑤ 轮优化故事」、数据手册补新数据、重写 Q6（QPS 怎么冲上去的）和 Q8（限流为什么搬进 Lua）、更新不足清单；`docs/build.md` 的 6.1 标记完成并补实测结论
 - 更早两轮的结论（备查）：优化记录 6 用 k6 对照定位出「Gin 自带的逐请求访问日志」是第一个天花板（写文件 6,500/s vs 丢弃 55,000/s，差 9 倍），并用隔离基准量出「一次抢购 4 次 Redis 往返」的上限约 9,000/s；优化记录 7 在不动链路结构的前提下把峰值做到 5,907 QPS，并修掉对账超卖隐患
 ## 阶段进度
 
@@ -174,4 +183,4 @@
 - [x] 阶段 12：购物车与结算页（/shop/cart 页面 + 商品页加购列；5 个前端函数与购物车越权校验均已实现并实测）
 - [x] 阶段 13：网关收口（微服务讨论稿已写完；网关 + trace 骨架已落地，12 条路由 / 6 个服务，6 处空已填完、5 处缺陷已修，六步验证走通）
 
-- [ ] 阶段 14：拆 user-service（进行中：`cmd/user` + 双模式鉴权中间件 + `USER_MODULE` 开关已就绪，`internal/user/auth.go` 的 2 处空待填）
+- [x] 阶段 14：拆 user-service（`cmd/user` 独立进程 + 双模式鉴权中间件 + `USER_MODULE` 开关 + 下游接 trace；2 处空已填、3 个缺陷已修、八步验证走通）
