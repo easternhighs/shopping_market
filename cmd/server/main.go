@@ -187,6 +187,20 @@ func main() {
 	// 付款时限：默认 15 分钟；演示时用环境变量 SECKILL_PAY_TIMEOUT 调短（例如 20s），
 	// 不用等一刻钟就能看到「超时关单、库存还回去」。
 	seckillService.SetPayTimeout(seckillPayTimeout())
+	// TODO(你来实现)：阶段 15 —— 给这一整块秒杀路由加一个「开关」。
+	//
+	//   要求：环境变量 SECKILL_MODULE=0 时，单体【不注册】下面这些秒杀路由；
+	//         不设（或设成别的值）时保持现状。
+	//   为什么要这个开关：阶段 15 把秒杀搬到了 :8083 那个独立进程，
+	//   演示时要能证明「8080 上真的没有 /seckill 了」，所以单体得能主动让位。
+	//   但默认值必须保持「注册」—— 这样「只跑单体、不跑网关」这条退路永远成立
+	//   （阶段 14 的 USER_MODULE 就是这个套路，见上面 124 行附近）。
+	//
+	//   写法：把下面从 seckillHandler 到 RegisterRoutes 这 11 行整块包进
+	//         if os.Getenv("SECKILL_MODULE") != "0" { ... }
+	//
+	//   ⚠ 这个开关【只管路由】，不负责后台任务 ——
+	//     下面那三个后台任务要单独处理，理由见那里的注释。
 	seckillHandler := seckill.NewHandler(seckillService)
 	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
 	// 自适应限流（6.3）：100 次/秒仍然是硬上限，但系统吃力时会自己往下收紧。
@@ -239,6 +253,23 @@ func main() {
 	// 页面本身不挂鉴权——得先能打开页面，才谈得上在里面登录。
 	shopHandler := shop.NewHandler(productService, seckillService)
 	shop.RegisterRoutes(r, shopHandler, authMiddleware)
+	// TODO(你来实现)：阶段 15 —— 这三个后台任务也要受同一个 SECKILL_MODULE 开关控制。
+	//
+	//   要求：SECKILL_MODULE=0 时，下面三行【一个都不启动】。
+	//   为什么它比路由那半边更要紧：这三个任务都会改 Redis 里的库存。
+	//   如果单体和新起的 :8083 同时跑，对账任务就会按「MySQL 里偏小的 sold」
+	//   反推剩余库存、把另一个进程刚扣掉的那部分又加回去 —— 高并发下直接超卖。
+	//   代码里的幂等保护（超时回补用 Redis SETNX 标记、cancelExpiredOrder 可重复调用）
+	//   只挡得住「同一笔订单被重复处理」；挡不住「两个进程各自看到不同的世界」，
+	//   因为 Queue.Settled() 读的是本进程内的计数器（internal/seckill/queue.go:173）。
+	//
+	//   写法：把 ConsumeOrders 那个 go func 加上后面两行 go ReconcileLoop / go ExpireLoop
+	//         一起包进 if os.Getenv("SECKILL_MODULE") != "0" { ... }
+	//
+	//   ⚠ 这里【不用】把 context.Background() 换成别的：单体靠「进程直接退出」收场，
+	//     循环停不停无所谓（进程一没，goroutine 自然就没了）。
+	//     需要认真处理 ctx 的是 cmd/seckill —— 那边必须用 runCtx，
+	//     否则收到退出信号时它不会停，优雅关闭就形同虚设。
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
 	go func() {

@@ -1,4 +1,4 @@
-.PHONY: run build run-gateway build-gateway run-user build-user env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -25,6 +25,20 @@ run-user:
 
 build-user:
 	go build -o bin/user ./cmd/user
+
+# 阶段 15：秒杀服务。把 internal/seckill 搬成独立进程（默认 :8083）。
+# 要让它真正接管流量，需要三件事配合：
+#   1) 网关那边设 GATEWAY_UPSTREAM_SECKILL=http://127.0.0.1:8083，
+#      网关才会把 /seckill、/metrics 转过来（网关代码一行都不用改）；
+#   2) 单体那边设 SECKILL_MODULE=0，让它别再提供秒杀接口、也别再跑秒杀的后台任务
+#      （两个进程同时跑对账会算错库存，原因见 docs/build.md 阶段 15）；
+#   3) 本服务设 SECKILL_TRUST_USER_ID_HEADER=1，它才会直接采用网关注入的 X-User-Id。
+#      直接压 8083 做基线时【不要】设它 —— 那时要自己验 JWT，成绩才和阶段 6 可比。
+run-seckill:
+	go run ./cmd/seckill
+
+build-seckill:
+	go build -o bin/seckill ./cmd/seckill
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d

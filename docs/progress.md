@@ -4,8 +4,16 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 14 已完成**（拆 user-service）。用户模块已经能独立跑在 `:8082`，网关把 `/login` `/register` `/me` 转过去；八步验证全部走通。下一步是阶段 15（拆 seckill，**需要复测 1 万 QPS**）
-- 本次完成：**阶段 14 收口：填完 2 处空、修掉 3 个缺陷，八步验证全部走通**（阶段 14 已完成）
+- 当前阶段：**阶段 15 进行中**（拆 seckill-service）。`cmd/seckill` 的骨架已经搭好、能编译，单体那边 `SECKILL_MODULE=0` 的开关也留好了位置；**4 处空待用户填写**。填完之后要做本阶段最重要的验证：**复测 1 万 QPS**，确认拆进程后热路径没有掉速
+- 本次完成：**阶段 15 起步：把秒杀模块搬成独立进程的骨架搭好（留 4 处空）**（阶段 15 进行中）
+  - 要解决的问题：阶段 14 把用户模块搬出去之后，最大的一块——秒杀——还在单体里。它是全项目唯一值得为性能单独部署的模块（自带 Redis 预扣、一次 Lua 往返、Kafka 削峰、6 个消费者、两个后台循环），所以这一章把它也搬成独立进程。关键词是「**搬家，不是重写，而且一跳都不能加**」：`internal/seckill` 的业务代码一行不改，热路径（限流 + 判重 + 预扣）仍然保持同一次 Redis 往返，网关对秒杀只做本地验签 + trace 注入
+  - 新增 `cmd/seckill`（默认 `:8083`），结构照 `cmd/user/main.go` 和单体的秒杀段：`gin.New()` + `trace.Middleware()` + 「只记异常」的 `accessLog()` + 指标中间件；`GET /healthz` 和 `GET /health` 两个健康检查路径（后者是为了让 k6 的 health 模式能直接压它）；MySQL 自动迁移三张秒杀表并建索引；Redis / Kafka 接线（`kafkaConsumerCount=6`、topic `seckill_orders`、消费组 `shopping_market_seckill`）；观测三件套（指标 + 采样器 + 告警）与 LAG 探针、自适应限流全部接好；退出时先停后台任务再 `srv.Shutdown`
+  - 单体 `cmd/server/main.go` 插入 2 处 `SECKILL_MODULE` 开关（**都是留空**）：一处包住秒杀路由注册（11 行），一处包住三个后台任务；两处必须用同一个变量，否则会出现「路由 404 了、后台对账还在偷偷改库存」的僵尸进程
+  - 为什么后台任务那半边更要紧：对账任务会按 MySQL 里偏小的 `sold` 反推剩余库存。两个进程同时跑，就可能把另一个进程刚扣掉的库存**凭空加回去**，高并发下直接超卖。代码里的幂等保护只挡得住「同一笔订单被重复处理」，挡不住「两个进程各自看到不同的世界」——因为 `Queue.Settled()` 读的是**本进程内**的计数器（`internal/seckill/queue.go:173`），跨进程根本不成立
+  - `scripts/k6_bench.js` 新增 `URL` 环境变量（默认仍是 `http://127.0.0.1:8080`），`SECKILL_URL` / `HEALTH_URL` 都从它拼出来，这样同一份脚本既能压单体基线、也能 `-e URL=http://127.0.0.1:8083` 直压秒杀服务做对照；`Makefile` 新增 `make run-seckill` / `make build-seckill`
+  - **4 处空**：① `cmd/seckill/main.go` 用 `runCtx` 起三个后台任务（`ConsumeOrders` / `ReconcileLoop` / `ExpireLoop`）；② `cmd/seckill/main.go` 的 `seckillTrustHeader()`（读 `SECKILL_TRUST_USER_ID_HEADER`，白名单 `1`/`true`，默认关）；③ 单体秒杀路由开关；④ 单体三个后台任务的开关
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净；`docs/build.md` 已补上「阶段 15」章节（含 4 处空的验收点、环境变量表、10 步验证流程）
+- 上一轮完成：**阶段 14 收口：填完 2 处空、修掉 3 个缺陷，八步验证全部走通**（阶段 14 已完成）
   - 用户把 `internal/user/auth.go` 的 2 处空填完后，代码能编能跑，但八步验证的第 5 步没过（带 token 走网关访问 `/me` 返回 401）。逐个做对照实验后抓出 3 个缺陷，都已修掉
   - **缺陷 1：存进上下文的是 `uint64`，下游按 `uint` 取 → 取不到。** `strconv.ParseUint` 返回 `uint64`，而下游 `Me` 用的是 `v.(uint)`、`/shop/my` 用的是 `c.GetUint`，gin v1.12 里这两者都是**严格类型断言**：`/me` 直接 401「登录状态无效」；`GetUint` 更危险——它**安静地返回 0**，接口会以「用户 0」的身份返回 200。对照实验：同一个 handler，8082 直连只带 JWT（存 `uint`）→ 200，只带 `X-User-Id`（存 `uint64`）→ 401。修法：`c.Set(contextUserID, uint(parsed))`
   - **缺陷 2：第 1 段 `c.Next()` 后面漏了 `return`，响应体被拼成非法 JSON。** gin 里 `c.Next()` 执行完还会回到中间件继续往下走，于是又进了第 2 段。实测响应体变成 `{"error":"登录状态无效"}{"error":"无效的登录令牌"}`——两个 JSON 拼在一起。如果第 1 段的 handler 返回的是 200，第二个 JSON 会被**追加到 200 的响应体后面**（状态码已经发出去了，gin 只在日志里打一行 WARNING），前端 `JSON.parse` 直接失败。走网关时之所以没暴露，只是因为网关会把 `Authorization` 一起转发、第 2 段验签居然成功了——**是运气，不是正确性**。修法：`c.Next()` 之后加 `return`
@@ -15,7 +23,7 @@
   - 填充后实测：`trust_header=true`；直连 8080 `/me` → 404；走网关 `POST /login` → 200 + token；带 token 走网关访问 `/me`、`/cart/items`、`/shop/my`、`/orders/1` → 全部 200；伪造 `X-User-Id: abc` 直连 8082 → 401；只带合法 `X-User-Id: 15` 直连 8082 → 200 且响应体是**一个**合法 JSON；裸令牌 → 401；不带凭证 → 401。另外 10 组 `TRUST_USER_ID_HEADER` 边界值（`1`/`true`/`TRUE`/` true `/` 1 ` → 开；`flase`/`0`/`yes`/`on`/未设置 → 关）全部符合要求
   - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净
   - 文档同步：`docs/build.md` 阶段 14 标记完成，补上填充后实测与 3 个缺陷的记录，并修掉第 6 步的笔误（`GET /orders` 这个路径其实不存在，只有 `POST /orders` 和 `GET /orders/:id`）
-- 上一轮完成：**阶段 14 起步：把用户模块搬成独立进程的骨架搭好（留 2 处空）**（当时阶段 14 进行中）
+- 更早一轮完成：**阶段 14 起步：把用户模块搬成独立进程的骨架搭好（留 2 处空）**（当时阶段 14 进行中）
   - 要解决的问题：阶段 13 的网关只是「把请求转给同一个单体」，等于门立起来了、屋里还是同一间房。这一轮开始**真的把模块搬出去**，第一个挑 `internal/user`——它最小（只读一张 `users` 表）、和秒杀热路径无关，而且它是「鉴权」的源头，搬走之后「网关验一次、下游信头部」这条设计才真正落地
   - 关键词是「搬家，不是重写」：`internal/user` 的 `service.go` / `repository.go` / `model.go` **一行没改**，只做三件事：① 新增 `cmd/user`（默认 `:8082`）把它单独跑起来；② 把「用哪个鉴权中间件」从模块内部挪到调用方决定——`RegisterRoutes` 现在多收一个 `auth gin.HandlerFunc` 参数（和 `internal/shop/router.go` 一个风格，模块不用再关心自己跑在哪儿）；③ 给下游补上 `trace.Middleware()`，把阶段 13 遗留的「编号传下来了但下游没人接」补完（单体入口也一起补了，`accessLog` 现在会打出 trace id）
   - 鉴权中间件 `AuthMiddleware(trustHeader)` 有**两种模式**：`trustHeader=true` 时优先采用网关注入的 `X-User-Id`（省一次验签），头里没值才回退验 JWT；`false` 时永远验 JWT。`trustHeader` 由 `TrustHeaderFromEnv()` 决定，环境变量 `TRUST_USER_ID_HEADER` **默认关**——一旦打开，请求头里写你是谁你就是谁，只有「明确知道自己在内网、前面有网关」时才该开
@@ -184,3 +192,5 @@
 - [x] 阶段 13：网关收口（微服务讨论稿已写完；网关 + trace 骨架已落地，12 条路由 / 6 个服务，6 处空已填完、5 处缺陷已修，六步验证走通）
 
 - [x] 阶段 14：拆 user-service（`cmd/user` 独立进程 + 双模式鉴权中间件 + `USER_MODULE` 开关 + 下游接 trace；2 处空已填、3 个缺陷已修、八步验证走通）
+
+- [ ] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；骨架已搭、4 处空待填，填完要复测 1 万 QPS）

@@ -972,6 +972,125 @@ shopping_market/
 - 完成标志：上面 8 步全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
 - 遗留（阶段 15 再做）：seckill 还在单体里。拆它是下一章，也是性能风险最大的一章——**必须复测 1 万 QPS**。
 
+### 阶段 15：拆 seckill-service（进行中）
+
+- 为什么做这一章：阶段 14 把用户模块搬出去之后，剩下最大的一块就是秒杀。它是这个项目的
+  「主角」——高并发的所有设计（Redis 预扣、一次 Lua 往返、Kafka 削峰、对账、超时关单）
+  全都长在它身上。把它搬成独立进程，等于**把主角单独请进一个房间**，好处有三个：
+  ① 它本身就是一块「数据自治」的完整业务（三张专属表 + 自己的 Redis Key + 自己的 Kafka topic），
+  搬走不用碰业务代码；
+  ② 它独占的资源（6 个消费者 goroutine、两个后台循环）以后可以单独扩缩容，不和别的模块抢；
+  ③ 也最实际：它是全项目**唯一值得为性能单独部署**的模块。
+- 这一章的关键词是「**搬家，不是重写，而且一跳都不能加**」：
+  `internal/seckill` 里的业务代码（`service.go` / `cache.go` / `queue.go` / `reconcile.go` / `expire.go`）
+  **一行都不改**，只做四件事：
+  1. 新增 `cmd/seckill`，把它单独跑成一个进程（默认 `:8083`）；
+  2. 给单体补上 `SECKILL_MODULE=0` 开关，让单体**主动让位**（不再注册秒杀路由、也不再跑秒杀后台任务）；
+  3. 观测那一整套（指标 / 采样器 / 告警 / LAG 探针 / 自适应限流）在秒杀服务里重新接一遍——
+     这套东西本来就是围绕秒杀做的，跟着它走；
+  4. 压测脚本 `scripts/k6_bench.js` 的目标地址改成可配置（`-e URL=...`），
+     这样同一份脚本既能压单体，也能直压 8083 做对照。
+- 这一章刻意不做的事：
+  - **不把秒杀链路再切碎**。限流、判重、预扣仍然在同一次 Redis Lua 往返里完成，
+    网关对秒杀只做本地验签 + trace 注入，不加任何 Redis 调用（见 `docs/microservices.md` 第 5.2 节）。
+    拆服务最容易犯的错就是「顺手把库存也拆出去」——那会把 1 次往返变成 3 次，1 万 QPS 直接掉没。
+  - **不做服务发现 / 配置中心**。服务数量是固定的，一个环境变量指过去就够。
+  - **不删单体里的秒杀代码**。不设 `SECKILL_MODULE` 就是老样子，退路永远留着。
+
+- 改动与新增的文件：
+
+  | 文件 | 作用 | 状态 |
+  | --- | --- | --- |
+  | `cmd/seckill/main.go` | 秒杀服务进程入口：`SECKILL_ADDR`、`GET /healthz` + `GET /health`、Redis/Kafka 接线、观测三件套、优雅退出 | 骨架（2 处空待填） |
+  | `cmd/server/main.go` | 秒杀路由与三个后台任务各加一个 `SECKILL_MODULE` 开关（共 2 处空） | 骨架（2 处空待填） |
+  | `scripts/k6_bench.js` | 新增 `URL` 环境变量，`SECKILL_URL` / `HEALTH_URL` 都从它拼出来 | 完整 |
+  | `Makefile` | 新增 `make run-seckill` / `make build-seckill` | 完整 |
+
+- **这一章留给用户填的 4 处空**（每处上方都有一段注释，把思路、要求和容易踩的坑写清楚了）：
+
+  | # | 文件 | 位置 | 要做的事 | 验收点 |
+  | --- | --- | --- | --- | --- |
+  | 1 | `cmd/seckill/main.go` | `main()` 里 `runCtx` 定义之后 | 用 `go` 起三个后台任务：`ConsumeOrders(runCtx)`、`ReconcileLoop(runCtx, reconcileInterval)`、`ExpireLoop(runCtx)`，全部挂在 `runCtx` 上 | 按 Ctrl+C 后进程**立刻**退出；Kafka 里的抢购消息能被写进 MySQL |
+  | 2 | `cmd/seckill/main.go` | `seckillTrustHeader()` | 读环境变量 `SECKILL_TRUST_USER_ID_HEADER`，只有 `1` / `true`（去首尾空格、忽略大小写）算「开」 | 不设时 `/healthz` 里 `trust_header=false`；设 `1` 后变 `true` |
+  | 3 | `cmd/server/main.go` | 秒杀路由块之前 | 把 `seckillHandler` 到 `seckill.RegisterRoutes(...)` 那 11 行整块包进 `if os.Getenv("SECKILL_MODULE") != "0" { ... }` | 设 `SECKILL_MODULE=0` 后，直连 8080 的秒杀接口 → **404** |
+  | 4 | `cmd/server/main.go` | 三个后台任务之前 | 把 `go` 起 `ConsumeOrders` / `ReconcileLoop` / `ExpireLoop` 那三行包进**同一个**开关 | 设 `SECKILL_MODULE=0` 后，单体不再消费、不再对账、不再关单 |
+
+- 为什么空 3 和空 4 是**同一件事的两半**：只关路由不关后台任务，单体就变成一具「不接客、
+  却在后台偷偷改库存」的僵尸——外面看着 404 了，里面的对账循环照样每 30 秒跑一次。
+  所以两者必须用同一个变量控制。（阶段 14 的 `USER_MODULE` 只涉及路由，因为它没有后台任务。）
+- 为什么空 4 那半边**更要紧**：这三个任务都会改 Redis / MySQL 里的库存数字。
+  如果一个进程刚把某件商品的库存扣掉，另一个进程又按 MySQL 里偏小的 `sold` 反推剩余库存、
+  把刚扣掉的那部分**凭空加回去**——高并发下就是直接超卖。
+  代码里确实有幂等保护（超时回补用 Redis SETNX 打标记、`cancelExpiredOrder` 可重复调用），
+  但那些保护只挡得住「同一笔订单被重复处理」；挡不住「两个进程各自看到不同的世界」——
+  因为 `Queue.Settled()`（对账用来判断「队列安静了吗」的那句）读的是**本进程内**的计数器
+  （见 `internal/seckill/queue.go:173`），跨进程根本不成立。所以只能真的只让一个进程跑，不能指望幂等兜底。
+- 为什么空 1 必须用 `runCtx`、不能抄单体的 `context.Background()`：
+  单体是「进程一退，goroutine 自然就没了」，所以它怎么写都无所谓；
+  而秒杀服务是从 `runCtx` 出发做优雅退出的——如果循环挂在 `Background()` 上，
+  进程收到退出信号时它们**不会停**，下面那句 `defer stopRun()` 就形同虚设，进程会拖着不退出。
+  这是本阶段唯一一处「抄的时候必须改」的地方，注释里也标了。
+- 为什么 `seckillTrustHeader` 要**另起一个环境变量名**，而不是复用阶段 14 的 `TRUST_USER_ID_HEADER`：
+  两个服务将来可能部署在不同机器上，各自需要一个开关；共用一个名字，
+  总有一天会出现「只想改秒杀的，结果把用户服务的也改了」。
+  另外它的**默认值必须是关**：信任头本身没有任何防伪能力，默认打开的话，
+  任何人手写一个 `X-User-Id: 15` 就能免登录抢购、还能抢别人的限购名额。
+
+- 启动方式（三个进程，各开一个窗口）：
+
+  ```powershell
+  # 窗口 1：单体。SECKILL_MODULE=0 表示「秒杀路由和秒杀后台任务都不在这里」，
+  #         这样能证明 /seckill/** 真的搬到 8083 去了。不设这个变量也能跑，那是退路。
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  $env:SECKILL_MODULE="0"
+  go run ./cmd/server
+
+  # 窗口 2：秒杀服务。TRUST 变量打开后，它直接采信网关注入的 X-User-Id，不再自己验 JWT。
+  $env:SECKILL_TRUST_USER_ID_HEADER="1"
+  make run-seckill            # 等价于 go run ./cmd/seckill
+
+  # 窗口 3：网关。把秒杀流量指向 8083。
+  $env:GATEWAY_UPSTREAM_SECKILL="http://127.0.0.1:8083"
+  make run-gateway
+  ```
+
+  如果同时要跑阶段 14 的用户服务，窗口 3 再加一行 `$env:GATEWAY_UPSTREAM_USER="http://127.0.0.1:8082"`。
+
+  | 环境变量 | 默认值 | 说明 |
+  | --- | --- | --- |
+  | `SECKILL_ADDR` | `:8083` | 秒杀服务的监听地址 |
+  | `SECKILL_TRUST_USER_ID_HEADER` | 空（关） | 设成 `1` / `true`：直接采用网关写下的 `X-User-Id` |
+  | `SECKILL_REDIS_ADDR` | `127.0.0.1:6379` | 秒杀服务用的 Redis 地址 |
+  | `SECKILL_KAFKA_BROKERS` | `127.0.0.1:9092` | Kafka broker，多个用英文逗号分隔 |
+  | `SECKILL_PAY_TIMEOUT` | `15m` | 付款时限；演示时调短（例如 `20s`）好观察超时关单 |
+  | `SECKILL_MODULE` | 空（开） | 单体专用。设成 `0`：单体不再注册秒杀路由、也不再跑秒杀后台任务 |
+  | `GATEWAY_UPSTREAM_SECKILL` | 空 | 网关专用。设成 `http://127.0.0.1:8083` 把秒杀流量转走 |
+
+- 验证流程（在 4 处空都填完之后做）：
+  1. 三个进程都在：`8080`（单体，`SECKILL_MODULE=0`）、`8083`（秒杀服务）、`8081`（网关）。
+  2. `GET http://127.0.0.1:8083/healthz` → **200**，`service` 是 `seckill`、
+     `trust_header` 是 `true`。是 `false` 说明空 2 没填对、或者环境变量没设上。
+  3. 直连单体确认让位了：`GET http://127.0.0.1:8080/seckill/activities` → **404**
+     （设了 `SECKILL_MODULE=0`）。回 200 或 401 都说明开关没生效。
+  4. 走网关访问同一个秒杀接口 → 正常返回。这一步能过，就证明请求真的转到了 8083。
+  5. 抢购一笔（走网关、带 `demo1` 的 token）→ **200**；隔一两秒查 MySQL 的 `seckill_orders`，
+     记录进来了，说明空 1 里的消费者真的在跑。
+  6. 幂等：同一个 `request_id` 再抢一次 → 不会多出第二张订单。
+  7. 超时关单：把 `SECKILL_PAY_TIMEOUT` 调到 `20s` 重启秒杀服务，抢购后不付款 → 到点后订单关闭、
+     库存回补（Redis 和 MySQL 两边都能看到数字回来），说明空 1 里的 `ExpireLoop` 也在跑。
+  8. **1 万 QPS 复测（本阶段最重要的一步）**：`k6 run -e URL=http://127.0.0.1:8083 scripts/k6_bench.js`，
+     和阶段 6 的基线对照，确认拆进程后热路径**没有掉速**。
+  9. 页面回归：`/shop`、`/shop/seckill`、`/demo` 三个页面还能正常打开、能下单。
+     注意这三个页面在**单体进程内**直接调用 `seckill.Service`（不是走 HTTP），
+     所以它们读到的秒杀数据仍然来自 8080 这个进程——这是本章唯一「搬不干净」的地方，
+     刻意保留：页面是演示用的，不值得为它绕一圈 HTTP。
+  10. trace：挑一次会返回 4xx 的秒杀请求（访问日志只记异常），带上固定的 `X-Trace-Id`，
+      到秒杀服务的日志里搜同一个编号，应该搜得到。
+- 完成标志：上面 10 步全部走通（其中第 8 步的 1 万 QPS 复测是本阶段的硬指标），
+  且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
+- 状态：骨架已搭好（`cmd/seckill` 已经能编译），**4 处空待用户填写**。
+  填完之后按上面 10 步验证，再回来把本节标题改成「（已完成）」并补上实测记录。
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

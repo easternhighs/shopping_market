@@ -16,8 +16,13 @@ const NS = Number(__ENV.NS || '0') || Date.now();
 const RUN_BASE = NS * 1000;
 
 const SECRET = 'shopping_market_secret';
-const SECKILL_URL = `http://127.0.0.1:8080/seckill/items/${ITEM_ID}/orders`;
-const HEALTH_URL = 'http://127.0.0.1:8080/health';
+// BASE 是压测目标地址，默认直连单体 8080。
+// 阶段 15 把秒杀拆成独立进程之后，可以用它换目标做对照：
+//   -e URL=http://127.0.0.1:8083   直压秒杀服务（不做鉴权代理，基线用这个）
+//   -e URL=http://127.0.0.1:8081   走网关（多一跳，用来看网关的代价）
+const BASE = __ENV.URL || 'http://127.0.0.1:8080';
+const SECKILL_URL = `${BASE}/seckill/items/${ITEM_ID}/orders`;
+const HEALTH_URL = `${BASE}/health`;
 
 const cOk = new Counter('ok');
 const cPerUser = new Counter('biz_per_user_limit');
