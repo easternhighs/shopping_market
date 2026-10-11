@@ -199,30 +199,15 @@ func main() {
 	runCtx, stopRun := context.WithCancel(context.Background())
 	defer stopRun()
 
-	// TODO(你来实现)：把三个后台任务启动起来，全部挂在 runCtx 上。
-	//
-	//   1. Kafka 消费者：调用 seckillService.ConsumeOrders(runCtx)。
-	//      它内部是阻塞的（一直循环拉消息），所以要用 go 起一个 goroutine；
-	//      返回 error 时用 log.Printf 打一行。
-	//   2. 库存对账：go seckillService.ReconcileLoop(runCtx, reconcileInterval)。
-	//   3. 超时关单：go seckillService.ExpireLoop(runCtx)。
-	//
-	//   可以照抄 cmd/server/main.go 里那三行（搜 ConsumeOrders 就能找到），
-	//   但要改两处：
-	//     a. 第一个参数换成 runCtx —— 那里的写法是 context.Background()。
-	//        这是旧习惯：单体靠「进程直接退出」收场，所以循环停不停无所谓；
-	//        这里如果也用 Background，进程收到退出信号时这三个循环不会停，
-	//        下面的 defer stopRun() 就形同虚设，进程会拖着不退出。
-	//     b. 对账周期用上面定义的 reconcileInterval。
-	//
-	// ⚠ 这三个任务【同一时刻只能有一个进程在跑】。这正是单体必须支持
-	//   SECKILL_MODULE=0 的原因：两个进程同时跑库存对账，就会出现
-	//   「一个进程刚把库存扣掉、另一个进程按数据库里偏小的 sold 反推、
-	//   把这份库存又凭空加回去」——高并发下直接超卖。
-	//   代码里确实有幂等保护（超时回补用 Redis SETNX 标记、cancelExpiredOrder 可重复调用），
-	//   但那些保护都只针对「同一笔订单被重复处理」；而 Queue.Settled()（对账用来判断
-	//   「队列安静了吗」的那句）读的是【本进程内】的计数器（见 internal/seckill/queue.go:173），
-	//   跨进程根本不成立。所以不能指望幂等兜底，必须真的只让一个进程跑。
+	//kafka消费者
+	go func() {
+		if err := seckillService.ConsumeOrders(runCtx); err != nil {
+			log.Printf("秒杀消费端退出: %v", err)
+		}
+	}()
+	//go协程库存对账 和超时关单
+	go seckillService.ReconcileLoop(runCtx, reconcileInterval)
+	go seckillService.ExpireLoop(runCtx)
 
 	// ── 观测任务的接线 ──────────────────────────────────────────────────────
 	// LAG 探针：每 5 秒问一次 Kafka「消费组落后多少条消息」，答案留在内存里。
@@ -285,28 +270,14 @@ func main() {
 }
 
 // seckillTrustHeader 决定「本服务要不要信任网关注入的 X-User-Id 头」。
-//
-// TODO(你来实现)：照着 internal/user/auth.go 里 TrustHeaderFromEnv 的规则写一遍，
-// 只换一个环境变量名（SECKILL_TRUST_USER_ID_HEADER）。要求：
-//  1. 用 os.Getenv("SECKILL_TRUST_USER_ID_HEADER") 取值；
-//  2. 先 strings.TrimSpace 去掉首尾空格再判断（容器编排里很容易多出一个空格）；
-//  3. 只有 "1" 和 "true" 算【开】，而且忽略大小写（"TRUE"、"True" 也算开）；
-//     其它一切值 —— 空串、没设置、"0"、"yes"、"on" —— 统统算【关】；
-//  4. 返回 true 表示「信任」，false 表示「不信任」。
-//
-// 为什么变量名不直接用 TRUST_USER_ID_HEADER 复用阶段 14 那个：
-// 两个服务将来可能部署在不同机器上，各自需要一个开关；共用一个名字，
-// 总有一天会出现「只想改秒杀的，结果把用户服务的也改了」。
-//
-// ⚠ 默认必须是【关】，两个理由：
-//
-//	a. 安全：信任头本身没有任何防伪能力。默认打开的话，任何人手写一个
-//	   "X-User-Id: 15" 就能免登录抢购，还能抢别人的限购名额。
-//	b. 可比性：阶段 6 的 1 万 QPS 基线是在「自己验 JWT」的前提下测出来的。
-//	   默认信任头会让这一章的成绩少一次验签开销，和基线就不是同一件事了。
+// 默认必须是【关】：信任头本身没有任何防伪能力，默认打开的话，
+// 任何人手写一个 "X-User-Id: 15" 就能免登录抢购、还能抢别人的限购名额。
 func seckillTrustHeader() bool {
-	// TODO(你来实现)：把下面这行占位换成真正的判断。
-	return false
+	rawUserIDHeader := os.Getenv("SECKILL_TRUST_USER_ID_HEADER")
+
+	userIDHeader := strings.TrimSpace(rawUserIDHeader)
+
+	return userIDHeader == "1" || strings.EqualFold(userIDHeader, "true")
 }
 
 // accessLog 和 cmd/server/main.go、cmd/user/main.go 里那两份一样：

@@ -4,8 +4,20 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 15 进行中**（拆 seckill-service）。`cmd/seckill` 的骨架已经搭好、能编译，单体那边 `SECKILL_MODULE=0` 的开关也留好了位置；**4 处空待用户填写**。填完之后要做本阶段最重要的验证：**复测 1 万 QPS**，确认拆进程后热路径没有掉速
-- 本次完成：**阶段 15 起步：把秒杀模块搬成独立进程的骨架搭好（留 4 处空）**（阶段 15 进行中）
+- 当前阶段：**阶段 15 已完成**（拆 seckill-service）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务）到此收尾：`cmd/gateway` / `cmd/user` / `cmd/seckill` 三个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` 两个开关可以一键让位（不设变量就是原来那个单体）。下一步待定：可选继续拆 order / product，或回到单体做更深一层的性能优化
+- 本次完成：**阶段 15 收口：填完 4 处空、修掉 4 个缺陷，10 步验证全部走通（含 1 万 QPS 复测无掉速）**（阶段 15 已完成）
+  - 用户把 4 处空填完后代码能编能跑，但验证过程中抓出 4 个缺陷（含一个很隐蔽的「僵尸消费者」），全部修掉后 10 步验证走通
+  - **缺陷 1（最值得记、也是很好的面试素材）：单体在 `SECKILL_MODULE=0` 时仍然创建了 6 个 Kafka 消费者。** 创建消费者的循环原来放在开关**外面**，而 kafka-go 的 `NewReader` 一创建就加入消费组（`reader.go:744` 里有 `go r.run(cg)`）。于是单体明明「让位」了，却仍有 6 个僵尸消费者占住 6 个分区里的 0/4/5，把消息**拉走却不处理**：抢购照样返回 **200**，但订单**永远不落库**，消费组积压涨到 **444 万条**。修法：把创建循环挪进 `if os.Getenv("SECKILL_MODULE") != "0"` 里面，关掉时一个都不建；修完消费组变成 `Stable` 的 6 个成员、**0 个 `server.exe`**。教训：**「不注册路由」不等于「没在后台干活」**，凡是「一创建就有副作用」的组件（消费者、定时器）都要和路由放进同一个开关
+  - 另 3 个缺陷：① 用户写的 `}` 位置错，后面的语句被关进了错误的作用域（编译期就报错）；② `adaptiveController` 被误包进 `if` 块——它必须在开关外面无条件创建，否则关了秒杀模块连指标中间件都没了；③ 环境变量名拼错成 `SECKULL_TRUST_USER_ID_HEADER`（少了一个 `I`）→ 改回 `SECKILL_`，不修的话 `trust_header` 恒为 `false`、走网关的抢购会全线 401
+  - 10 步验证结论：`GET :8083/healthz` → **200**（`trust_header=true`，空 2 生效）；直连 8080 的 `/seckill/activities` → **404**（空 3 生效，单体确实让位）；走网关 `GET :8081/shop/seckill` → **200**、`POST :8081/seckill/items/42/orders` → **200** 且约 4 秒后 MySQL 落库（`id=4824616`、`status=pending`，空 1 的消费者在跑）；同一个 `request_id` 重放 → **409 `{"error":"重复的 request_id"}`** 且库里只有 **1 行**；`SECKILL_PAY_TIMEOUT=20s` 下抢单不付款 → 20 秒后 MySQL `status=cancelled`、Redis `stock` 79→**80**、该用户已购 1→**0**、MySQL `sold` 1→**0**（空 1 的 `ExpireLoop` 也在跑）；`/shop`、`/shop/seckill`、`/demo`、`/shop/data`、`/demo/data` 全 **200**；trace 编号在秒杀服务日志（`trace-s15-fixed-001`）和网关日志（`trace-s15-gw-002`）里各自命中
+  - 超时关单踩的坑：第一次等了 35 秒没关单。原因是前面压测往延时队列 ZSET 灌了 34.6 万笔订单，而 `ExpireLoop` 每轮只处理 200 笔、新单排在后面；先清掉更早的积压，再抢就立刻关单成功。说明「顺序扫描 + 小批量」在积压时会出现延迟，后续可考虑按时间分片或调大 `expireBatchSize`
+  - **1 万 QPS 复测（本阶段硬指标）**：直压 `:8083`、商品 item 47（库存 20 万、限购 5）——128 VU 12.67 万次（约 10.5k/s、p50 10.7ms、p99 19.7ms）、256 VU 13.49 万次（**11,240/s**、p50 20.6ms、p99 34.0ms）、512 VU 13.77 万次（11,477/s、p50 40.6ms、p99 68.3ms）；三档全部 **0 限流 / 0 业务失败 / 0 建连错误**
+  - A/B 对照：同脚本、同 256 VU，对照组是把 `httpport` 改成 8083、**仍带秒杀模块**的单体二进制 —— 单体 134,910 次 / p50 20.7ms vs 秒杀服务 134,876 次 / p50 20.6ms，**几乎一致，拆进程没有掉速**。口径说明：阶段 6 那个 16k 峰值是 64~1024 VU 扫出来的最高点，本阶段的验收口径是「拆完不掉速」，三档都 ≥10.5k 即达标
+  - 顺手记录一个**遗留不足**（本阶段不改）：`internal/seckill/cache.go` 的热路径 Lua 只对限购 key `seckill:item:<id>:user:<uid>` 做 `INCRBY`、**从不设置 TTL**。压测后 Redis `DBSIZE` 一度到 **713 万**，清理时一次扫出 20 万 + 68 万条 `user:*` key。限购计数不能太早过期，但**必须**在活动结束后回收，建议加「活动结束清理」或设一个「大于活动时长」的 TTL
+  - 环境数据清理：删掉压测商品 45/47 的订单与商品行、清空 `seckill:orders:expire`、用 Lua SCAN+DEL 清掉 88 万条 user key；MySQL 里仍有约 **442 万条**历史 pending 单，会拖慢 `ExpireLoop`，演示前建议先清或调大 `expireBatchSize`
+  - 文档产出：`docs/build.md` 阶段 15 标记完成，并补上「填充后实测 / 1 万 QPS 表格 / 4 个缺陷 / 遗留不足」；`docs/progress.md` 勾选阶段 15
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净；两个改动过的 `.go` 文件 CR=0 / BOM=False
+- 上一阶段起步：**阶段 15 起步：把秒杀模块搬成独立进程的骨架搭好（留 4 处空）**（当时阶段 15 进行中）
   - 要解决的问题：阶段 14 把用户模块搬出去之后，最大的一块——秒杀——还在单体里。它是全项目唯一值得为性能单独部署的模块（自带 Redis 预扣、一次 Lua 往返、Kafka 削峰、6 个消费者、两个后台循环），所以这一章把它也搬成独立进程。关键词是「**搬家，不是重写，而且一跳都不能加**」：`internal/seckill` 的业务代码一行不改，热路径（限流 + 判重 + 预扣）仍然保持同一次 Redis 往返，网关对秒杀只做本地验签 + trace 注入
   - 新增 `cmd/seckill`（默认 `:8083`），结构照 `cmd/user/main.go` 和单体的秒杀段：`gin.New()` + `trace.Middleware()` + 「只记异常」的 `accessLog()` + 指标中间件；`GET /healthz` 和 `GET /health` 两个健康检查路径（后者是为了让 k6 的 health 模式能直接压它）；MySQL 自动迁移三张秒杀表并建索引；Redis / Kafka 接线（`kafkaConsumerCount=6`、topic `seckill_orders`、消费组 `shopping_market_seckill`）；观测三件套（指标 + 采样器 + 告警）与 LAG 探针、自适应限流全部接好；退出时先停后台任务再 `srv.Shutdown`
   - 单体 `cmd/server/main.go` 插入 2 处 `SECKILL_MODULE` 开关（**都是留空**）：一处包住秒杀路由注册（11 行），一处包住三个后台任务；两处必须用同一个变量，否则会出现「路由 404 了、后台对账还在偷偷改库存」的僵尸进程
@@ -193,4 +205,4 @@
 
 - [x] 阶段 14：拆 user-service（`cmd/user` 独立进程 + 双模式鉴权中间件 + `USER_MODULE` 开关 + 下游接 trace；2 处空已填、3 个缺陷已修、八步验证走通）
 
-- [ ] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；骨架已搭、4 处空待填，填完要复测 1 万 QPS）
+- [x] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；4 处空已填、4 个缺陷已修、10 步验证走通，1 万 QPS 复测无掉速）

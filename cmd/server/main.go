@@ -174,9 +174,18 @@ func main() {
 	// 已经建好的 topic 要执行 `make kafka-partitions` 增加分区才会生效。
 	const kafkaConsumerCount = 6
 	kafkaProducer := kafkapkg.NewProducer(kafkaBrokers, kafkaTopic)
-	kafkaConsumers := make([]*kafkapkg.Consumer, 0, kafkaConsumerCount)
-	for i := 0; i < kafkaConsumerCount; i++ {
-		kafkaConsumers = append(kafkaConsumers, kafkapkg.NewConsumer(kafkaBrokers, kafkaTopic, kafkaGroupID))
+	// ⚠ 消费者必须和下面那三个后台任务共用同一个开关，而且是【创建】时就要挡住，
+	// 不能只在「启动时」挡：kafka-go 的 NewReader 一创建就加入消费组（源码里直接 go r.run）。
+	// 所以 SECKILL_MODULE=0 时如果只是不跑 ConsumeOrders，这 6 个消费者照样会加入消费组、
+	// 占住一部分分区却不消费 —— 秒杀服务那边就只剩另一半分区能用，消息一直卡在 Kafka 里。
+	// 关掉时干脆一个都不建：队列里没有消费者时 Publish / Settled 照常工作，
+	// 关掉开关的进程本来也没有后台任务会用到它们。
+	var kafkaConsumers []*kafkapkg.Consumer
+	if os.Getenv("SECKILL_MODULE") != "0" {
+		kafkaConsumers = make([]*kafkapkg.Consumer, 0, kafkaConsumerCount)
+		for i := 0; i < kafkaConsumerCount; i++ {
+			kafkaConsumers = append(kafkaConsumers, kafkapkg.NewConsumer(kafkaBrokers, kafkaTopic, kafkaGroupID))
+		}
 	}
 	seckillCache := seckill.NewCache(redisClient)
 	seckillQueue := seckill.NewQueue(kafkaProducer, kafkaConsumers...)
@@ -187,31 +196,21 @@ func main() {
 	// 付款时限：默认 15 分钟；演示时用环境变量 SECKILL_PAY_TIMEOUT 调短（例如 20s），
 	// 不用等一刻钟就能看到「超时关单、库存还回去」。
 	seckillService.SetPayTimeout(seckillPayTimeout())
-	// TODO(你来实现)：阶段 15 —— 给这一整块秒杀路由加一个「开关」。
-	//
-	//   要求：环境变量 SECKILL_MODULE=0 时，单体【不注册】下面这些秒杀路由；
-	//         不设（或设成别的值）时保持现状。
-	//   为什么要这个开关：阶段 15 把秒杀搬到了 :8083 那个独立进程，
-	//   演示时要能证明「8080 上真的没有 /seckill 了」，所以单体得能主动让位。
-	//   但默认值必须保持「注册」—— 这样「只跑单体、不跑网关」这条退路永远成立
-	//   （阶段 14 的 USER_MODULE 就是这个套路，见上面 124 行附近）。
-	//
-	//   写法：把下面从 seckillHandler 到 RegisterRoutes 这 11 行整块包进
-	//         if os.Getenv("SECKILL_MODULE") != "0" { ... }
-	//
-	//   ⚠ 这个开关【只管路由】，不负责后台任务 ——
-	//     下面那三个后台任务要单独处理，理由见那里的注释。
-	seckillHandler := seckill.NewHandler(seckillService)
-	seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
 	// 自适应限流（6.3）：100 次/秒仍然是硬上限，但系统吃力时会自己往下收紧。
 	// 判据是「平均延迟超过 50ms 或开始报 5xx」，规则见 internal/pkg/ratelimit/adaptive.go。
+	// 它必须声明在开关【外面】：下面的采样器回调（SetObserver / SetExtra）还要用它。
 	adaptiveController := ratelimit.NewController(5, 100, 50*time.Millisecond)
-	// 限流中间件只挂在秒杀的管理类接口上（建活动、查活动、建商品）。
-	// 抢购接口不带中间件：它的限流和库存扣减共用同一次 Redis 往返，
-	// 再套一层中间件就等于把刚省下来的往返又加回去（见 internal/seckill/cache.go 的 hotPathLuaScript）。
-	seckillGroup := protected.Group("/")
-	seckillGroup.Use(ratelimit.RateLimit(ratelimit.NewAdaptiveLimiter(seckillRateLimiter, adaptiveController), 100, time.Second, appMetrics.ObserveRateLimited))
-	seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
+
+	if os.Getenv("SECKILL_MODULE") != "0" {
+		seckillHandler := seckill.NewHandler(seckillService)
+		seckillRateLimiter := ratelimit.NewRedisLimiter(redisClient)
+		// 限流中间件只挂在秒杀的管理类接口上（建活动、查活动、建商品）。
+		// 抢购接口不带中间件：它的限流和库存扣减共用同一次 Redis 往返，
+		// 再套一层中间件就等于把刚省下来的往返又加回去（见 internal/seckill/cache.go 的 hotPathLuaScript）。
+		seckillGroup := protected.Group("/")
+		seckillGroup.Use(ratelimit.RateLimit(ratelimit.NewAdaptiveLimiter(seckillRateLimiter, adaptiveController), 100, time.Second, appMetrics.ObserveRateLimited))
+		seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
+	}
 
 	// LAG 探针：每 5 秒问一次 Kafka「消费组落后多少条消息」，把答案留在内存里。
 	// 采样器只读缓存，不做网络请求，所以采样节奏不会被 Kafka 拖慢（见 internal/pkg/kafka/lag.go）。
@@ -253,37 +252,22 @@ func main() {
 	// 页面本身不挂鉴权——得先能打开页面，才谈得上在里面登录。
 	shopHandler := shop.NewHandler(productService, seckillService)
 	shop.RegisterRoutes(r, shopHandler, authMiddleware)
-	// TODO(你来实现)：阶段 15 —— 这三个后台任务也要受同一个 SECKILL_MODULE 开关控制。
-	//
-	//   要求：SECKILL_MODULE=0 时，下面三行【一个都不启动】。
-	//   为什么它比路由那半边更要紧：这三个任务都会改 Redis 里的库存。
-	//   如果单体和新起的 :8083 同时跑，对账任务就会按「MySQL 里偏小的 sold」
-	//   反推剩余库存、把另一个进程刚扣掉的那部分又加回去 —— 高并发下直接超卖。
-	//   代码里的幂等保护（超时回补用 Redis SETNX 标记、cancelExpiredOrder 可重复调用）
-	//   只挡得住「同一笔订单被重复处理」；挡不住「两个进程各自看到不同的世界」，
-	//   因为 Queue.Settled() 读的是本进程内的计数器（internal/seckill/queue.go:173）。
-	//
-	//   写法：把 ConsumeOrders 那个 go func 加上后面两行 go ReconcileLoop / go ExpireLoop
-	//         一起包进 if os.Getenv("SECKILL_MODULE") != "0" { ... }
-	//
-	//   ⚠ 这里【不用】把 context.Background() 换成别的：单体靠「进程直接退出」收场，
-	//     循环停不停无所谓（进程一没，goroutine 自然就没了）。
-	//     需要认真处理 ctx 的是 cmd/seckill —— 那边必须用 runCtx，
-	//     否则收到退出信号时它不会停，优雅关闭就形同虚设。
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
-	go func() {
-		if err := seckillService.ConsumeOrders(context.Background()); err != nil {
-			log.Printf("秒杀消费端退出: %v", err)
-		}
-	}()
+	if os.Getenv("SECKILL_MODULE") != "0" {
+		go func() {
+			if err := seckillService.ConsumeOrders(context.Background()); err != nil {
+				log.Printf("秒杀消费端退出: %v", err)
+			}
+		}()
 
-	// 启动库存对账任务：每隔一段时间，用 MySQL 的 sold 修正 Redis 库存。
-	go seckillService.ReconcileLoop(context.Background(), 30*time.Second)
+		// 启动库存对账任务：每隔一段时间，用 MySQL 的 sold 修正 Redis 库存。
+		go seckillService.ReconcileLoop(context.Background(), 30*time.Second)
 
-	// 启动秒杀超时关单任务：到点还没付款的订单会被关掉，占用的库存还回商品池。
-	// 它同时走「Redis 延时队列」和「MySQL 兜底扫描」两条路，详见 expire.go。
-	go seckillService.ExpireLoop(context.Background())
+		// 启动秒杀超时关单任务：到点还没付款的订单会被关掉，占用的库存还回商品池。
+		// 它同时走「Redis 延时队列」和「MySQL 兜底扫描」两条路，详见 expire.go。
+		go seckillService.ExpireLoop(context.Background())
+	}
 
 	// 启动 6.3 的两个后台任务：采样循环和 LAG 探针。
 	// 它们都退出得很干脆（ctx 一取消就返回），进程退出时不会拖着不放。

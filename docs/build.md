@@ -972,7 +972,7 @@ shopping_market/
 - 完成标志：上面 8 步全部走通，且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
 - 遗留（阶段 15 再做）：seckill 还在单体里。拆它是下一章，也是性能风险最大的一章——**必须复测 1 万 QPS**。
 
-### 阶段 15：拆 seckill-service（进行中）
+### 阶段 15：拆 seckill-service（已完成）
 
 - 为什么做这一章：阶段 14 把用户模块搬出去之后，剩下最大的一块就是秒杀。它是这个项目的
   「主角」——高并发的所有设计（Redis 预扣、一次 Lua 往返、Kafka 削峰、对账、超时关单）
@@ -1001,8 +1001,8 @@ shopping_market/
 
   | 文件 | 作用 | 状态 |
   | --- | --- | --- |
-  | `cmd/seckill/main.go` | 秒杀服务进程入口：`SECKILL_ADDR`、`GET /healthz` + `GET /health`、Redis/Kafka 接线、观测三件套、优雅退出 | 骨架（2 处空待填） |
-  | `cmd/server/main.go` | 秒杀路由与三个后台任务各加一个 `SECKILL_MODULE` 开关（共 2 处空） | 骨架（2 处空待填） |
+  | `cmd/seckill/main.go` | 秒杀服务进程入口：`SECKILL_ADDR`、`GET /healthz` + `GET /health`、Redis/Kafka 接线、观测三件套、优雅退出 | 完整 |
+  | `cmd/server/main.go` | 秒杀路由与三个后台任务各加一个 `SECKILL_MODULE` 开关（共 2 处空） | 完整 |
   | `scripts/k6_bench.js` | 新增 `URL` 环境变量，`SECKILL_URL` / `HEALTH_URL` 都从它拼出来 | 完整 |
   | `Makefile` | 新增 `make run-seckill` / `make build-seckill` | 完整 |
 
@@ -1088,8 +1088,69 @@ shopping_market/
       到秒杀服务的日志里搜同一个编号，应该搜得到。
 - 完成标志：上面 10 步全部走通（其中第 8 步的 1 万 QPS 复测是本阶段的硬指标），
   且 `gofmt -l cmd internal` / `go vet ./...` / `go build ./...` 干净。
-- 状态：骨架已搭好（`cmd/seckill` 已经能编译），**4 处空待用户填写**。
-  填完之后按上面 10 步验证，再回来把本节标题改成「（已完成）」并补上实测记录。
+
+- 填充后实测（4 处空已填，10 步全部走通）：三个进程同时起——
+  `8080`（单体，`SECKILL_MODULE=0`）、`8083`（秒杀服务，`SECKILL_TRUST_USER_ID_HEADER=1`、
+  `SECKILL_PAY_TIMEOUT=20s`）、`8081`（网关，`GATEWAY_UPSTREAM_SECKILL=http://127.0.0.1:8083`）。
+  1. `GET :8083/healthz` → **200**，`service=seckill`、`trust_header=true`（空 2 生效）。
+  2. 直连 8080 的 `/seckill/activities` → **404**（空 3 生效，单体确实让位了）；
+     走网关 `GET :8081/shop/seckill` → **200**（证明流量真的转到了 8083）。
+  3. 抢购一笔：走网关 `POST :8081/seckill/items/42/orders` → **200**，约 4 秒后 MySQL
+     `seckill_orders` 出现该单（`id=4824616`、`status=pending`）→ 空 1 的消费者在跑。
+  4. 幂等：同一个 `request_id`（`s15-fix-4e843d90`）重放 → **409 `{"error":"重复的 request_id"}`**，
+     且 MySQL 里该 `request_id` 只有 **1 行**。
+  5. 超时关单：`SECKILL_PAY_TIMEOUT=20s` 下抢 item 42 不付款 → 20 秒后 MySQL `status=cancelled`、
+     Redis `stock` 79→**80**、该用户已购 1→**0**、MySQL `sold` 1→**0** → 空 1 的 `ExpireLoop` 也在跑。
+     （踩到一个坑：先等了 35 秒没关单。原因是前面压测往延时队列 ZSET 灌了 34.6 万笔订单，
+     `ExpireLoop` 每轮只处理 200 笔，新单排在后面；清掉更早的积压后立刻关单成功。）
+  6. 页面回归：`/shop`、`/shop/seckill`、`/demo`、`/shop/data`、`/demo/data` 全 **200**；
+     8080 的 `/seckill/**` → **404**；走网关 `/shop/my` → **200**。
+  7. trace：带 `X-Trace-Id: trace-s15-fixed-001` 直连 8083 得到 **409**，秒杀服务日志命中
+     `[秒杀服务] POST /seckill/items/42/orders status=409 cost=1.2745ms trace=trace-s15-fixed-001`；
+     另一个编号 `trace-s15-gw-002` 在网关日志命中 `[网关] GET /seckill/activities -> 401 0s trace=...`。
+
+- **1 万 QPS 复测（第 8 步的硬指标）**：直压 `:8083`，同一份 `scripts/k6_bench.js`，
+  商品 item 47（`total_stock=200000`、限购 5）：
+
+  | 并发 | 成功请求 | QPS | p50 | p99 | 限流 | 业务失败 | 建连错误 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 128 VU | 126,677 | ~10.5k | 10.7ms | 19.7ms | 0 | 0 | 0 |
+  | 256 VU | 134,876 | **11,240** | 20.6ms | 34.0ms | 0 | 0 | 0 |
+  | 512 VU | 137,728 | 11,477 | 40.6ms | 68.3ms | 0 | 0 | 0 |
+
+  A/B 对照（同脚本、同 256 VU；对照组是把 `httpport` 改成 8083、**仍带秒杀模块**的单体二进制）：
+
+  | 压测目标 | 成功请求 | p50 |
+  | --- | --- | --- |
+  | 秒杀服务 `:8083` | 134,876 | 20.6ms |
+  | 单体（对照） | 134,910 | 20.7ms |
+
+  两栏几乎一致 → **拆进程没有掉速**。说明：阶段 6 那个 16k 峰值是 64~1024 VU 扫出来的最高点，
+  本阶段的验收口径是「拆完不掉速」，三档都 ≥10.5k，符合预期。
+
+- 填空过程中实测抓出并修掉的 4 个缺陷（都很典型，建议记进面试素材）：
+  1. 用户写的 `}` 位置错，把后面的语句关进了错误的作用域（编译期就报错）。
+  2. **`adaptiveController` 被误包进 `if` 块**：它必须在开关外面无条件创建，
+     否则关了秒杀模块连指标中间件都没了。
+  3. **环境变量名拼错**：`SECKULL_TRUST_USER_ID_HEADER`（少了一个 `I`）→ 改回 `SECKILL_`。
+     不修的话信任头永远读不到，`trust_header` 恒为 `false`，走网关的抢购会全线 401。
+  4. **（最值得记的一个）单体在 `SECKILL_MODULE=0` 时仍然创建了 6 个 Kafka 消费者。**
+     原来创建消费者的循环放在开关**外面**，而 kafka-go 的 `NewReader` 一创建就加入消费组
+     （`reader.go:744` 里有 `go r.run(cg)`）。结果：单体明明「让位」了，却仍有 6 个僵尸消费者
+     占住 6 个分区里的 0/4/5，把消息**拉走却不处理**。现象极具迷惑性——抢购照样返回 **200**，
+     但订单**永远不落库**，消费组积压涨到 **444 万条**。修法：把创建循环挪进
+     `if os.Getenv("SECKILL_MODULE") != "0"` 里面，关掉时一个都不建；修复后消费组变成
+     `Stable` 的 6 个成员、**0 个 `server.exe`**。教训：**「不注册路由」不等于「没在后台干活」**，
+     凡是「一创建就有副作用」的组件（消费者、定时器）都要和路由纳入同一个开关。
+
+- 遗留 / 不足（本阶段记录、暂不改，留给后续优化）：
+  - **用户维度的 Redis key 没有过期时间**。`internal/seckill/cache.go` 的热路径 Lua 只对
+    `seckill:item:<id>:user:<uid>` 执行 `INCRBY`，**从不设置 TTL**。压测后 Redis `DBSIZE`
+    一度到 **713 万**，清理时一次扫出 20 万 + 68 万条 `user:*` key。这些 key 承担限购计数，
+    不能太早过期，但**必须**在活动结束后回收，建议加「活动结束清理」或设一个
+    「大于活动时长」的 TTL。
+  - MySQL 里仍留着历史压测的 **~442 万条 pending 订单**，会拖慢 `ExpireLoop`
+    （每 5 秒只处理 200 笔）。演示前建议先清空这些历史单，或调大 `expireBatchSize`。
 
 ## 8. 挖空式协作规则
 
