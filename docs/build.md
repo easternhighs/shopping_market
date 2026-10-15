@@ -1152,6 +1152,156 @@ shopping_market/
   - MySQL 里仍留着历史压测的 **~442 万条 pending 订单**，会拖慢 `ExpireLoop`
     （每 5 秒只处理 200 笔）。演示前建议先清空这些历史单，或调大 `expireBatchSize`。
 
+### 阶段 16：拆 product-service（含 inventory），并拆掉下单里那条同库事务（已完成）
+
+- 为什么做这一章：阶段 14、15 把 user 和 seckill 分别搬出去之后，`docs/microservices.md`
+  第 3.1 节点名的那行「最贵的代码」还留在原地——`order.Place` 把「写订单」和「扣库存」
+  放在**同一个 MySQL 事务**里。在单体里这是最省事、也最正确的写法，但它等于一根绳子
+  把订单和库存拴在一起：**这两个模块永远没法分家**。这一章就是把绳子剪断。
+- 关键词是「**搬家 + 剪绳子**」，拆成两件事：
+  1. **搬家**：新增 `cmd/product`（默认 `:8084`），把 `internal/product` + `internal/inventory`
+     一起搬过去；单体加一个 `PRODUCT_MODULE=0` 开关，一键让位（不设就是原来那个单体）。
+  2. **剪绳子**：下单不再「本进程开一个事务同时写订单和扣库存」，改成
+     **本地消息表（outbox）+ 跨进程同步扣减 + 后台重试补偿**。
+- 名词先解释清楚（面试时如果不能把下面这三个词用大白话讲明白，这一章就白做了）：
+  - **本地消息表 / outbox**：下单时先在**自己的库**里、和订单写在**同一个事务**里，
+    额外写一张小纸条：「我欠库存服务一次扣减，编号是 xxx」。订单和纸条要么都写成功、
+    要么都不写（本地事务管得住这个）。**这就是它比「直接调远程」可靠的地方**——
+    不会出现「库存扣了、订单却没写成」这种找不回来的账。纸条落库之后，再拿着编号去调库存服务；
+    调不动，就过一会儿拿纸条再来一次。
+  - **幂等**：「同一个请求做两遍，结果和做一遍一样」。跨进程调用一定会超时重试，
+    所以库存服务必须认得「这个编号我处理过了」——否则重试就会把库存扣两遍，也就是超卖。
+  - **最终一致**：中间那一小段时间（订单是 `pending_stock`、库存还没扣）两边的数字对不上，
+    这是**设计好的正常状态**，不是 bug；靠后台重试慢慢收敛。
+- 这一章刻意不做的事：
+  - **不把 inventory 再拆成独立进程**。商品和库存是同一条业务链（看 SKU 就要看库存），
+    拆开只会多一跳、多一个故障点，换不来任何好处。
+  - **不为这件事引入 MQ**。这里要的是「当场知道成功还是失败」，Kafka 是异步单向的，
+    用它反而要再绕一套回执。秒杀用 Kafka 是因为一万 QPS 的写请求必须削峰，普通下单没有这个量级。
+  - **不上分布式事务（2PC / Seata）**。整个系统就两个进程，用「本地消息表 + 重试」这种
+    最土也最稳的做法足够，而且每一行代码都能讲清为什么这么写。
+  - **不删单体里的商品 / 库存代码**。不设 `PRODUCT_MODULE` 就是老样子，退路永远留着。
+
+- **库存服务这边的关键设计**：`internal/inventory/deduct.go` 的 `ApplyDeduct`。
+  它是整章正确性的地基，四步都值得记住：
+
+  | 步 | 做什么 | 为什么 |
+  | --- | --- | --- |
+  | 1 | 先按 `request_id` 查账本 `stock_deducts` | 查到了就直接回上次的结论——重试绝不能把库存扣两遍 |
+  | 2 | 查不到 → 在**一个事务**里「先占坑、再扣减」（占坑 = 插一行 `request_id` 唯一的记录） | 占坑和扣减同生共死：进程万一崩在中间，占坑跟着回滚，不会留下「账本说扣过、库存其实没动」的假账 |
+  | 3 | 扣减按 SKU ID **排序**后逐个 `UPDATE ... WHERE quantity >= ?` | 两笔单都要扣 SKU 3 和 7，一笔按 3→7、一笔按 7→3，并发起来就会互相等对方的行锁（死锁）；固定顺序是最省事的解法 |
+  | 4 | 库存不足时把 `rejected` 也记进账本 | 这个编号以后每次重放都得到同一个答案，不会出现「先说不成功、后说成功」的反复 |
+
+  「占坑插不进去」还有另一种情况：**另一个请求正在处理同一个 `request_id`**。
+  这时不能瞎猜结果，返回 `ErrDeductInProgress`（HTTP 409 + `code=deduct_in_progress`），
+  意思是「现在还不知道结果，晚点再问」。
+- **订单状态机多了一个中间态 `pending_stock`**（`internal/order/model.go`）：
+
+  | 状态 | 含义 | 用户看到什么 |
+  | --- | --- | --- |
+  | `pending_stock` | 订单已收下，库存还在确认（阶段 16 新增） | 「订单已收下，正在确认库存」+ 刷新状态按钮 |
+  | `pending` | 库存已扣成功，等付款 | 正常的待付款 + 付款倒计时 |
+  | `cancelled` | 已取消（用户取消 / 库存不足 / 重试超限） | 已取消 |
+  | `paid` | 已付款 | 已支付 |
+
+  `pending_stock` 也算「占住了一单」，但付款接口**不允许**它付款：
+  库存都还没确认就让用户付钱，等于卖一件可能不存在的货。
+- **后台补偿任务** `RetryLoop`（`internal/order/retry.go`，每 2 秒一轮，挂在 `runCtx` 上）：
+  1. 捞出「便签还是 pending、到了重试时间、次数没用完」的订单（`RetryBatchSize=20`）；
+  2. 逐条**领取**（`ClaimOutboxRetry`，行锁 + 30 秒租约），领不到说明别的实例在处理，跳过；
+  3. 复查订单状态（这中间用户可能已经取消了，取消掉的单子不能再扣库存）；
+  4. 调库存服务：成功 → 订单 `pending` + 便签 `done`；真的不够 → 关单 + 便签 `dead`；
+     其它失败 → 次数 +1，按**指数退避**（1s → 2s → 4s …… 封顶 60s）约下一次。
+  次数用光（`OutboxMaxAttempts=8`）就 `giveUp`：关单 + 便签判死 + 把原因留在 `last_error` 里。
+  「放弃」不是「不管了」，而是把状态收拾干净，别让用户永远看到「确认中」。
+- **一个容易搞混的顺序问题**：库存扣成功之后，是**先改订单状态、再划掉便签**。
+  反过来的话，便签一划掉而订单状态没改成功，就再也没有人来救它了，订单会永远卡在 `pending_stock`。
+  按现在的顺序，任何一步失败都还有重试兜着（重试会重新扣一次库存，幂等，不会多扣）。
+
+- 改动与新增的文件：
+
+  | 文件 | 作用 | 状态 |
+  | --- | --- | --- |
+  | `cmd/product/main.go` | 商品服务进程入口：`PRODUCT_ADDR`（默认 `:8084`）、`/healthz` + `/health`、迁移商品/库存/扣减账本三张表、优雅退出 | 新增 |
+  | `internal/inventory/deduct.go` | `ApplyDeduct` + 账本读写 + `ErrDeductInProgress`（幂等地基） | 新增 |
+  | `internal/order/deduct_client.go` | `DeductClient`：透传 trace、带超时、把错误分成「确定不够」和「暂时说不清」两类 | 新增 |
+  | `internal/order/outbox.go` | `OrderOutbox` 结构体、重试常量、payload 序列化 | 新增 |
+  | `internal/order/retry.go` | `RetryLoop` / `retryOne` / `giveUp` 后台补偿任务 | 新增 |
+  | `internal/inventory/{model,repository,service,handler,router}.go` | `DeductRecord` 表、`ApplyDeduct` 调用链、`POST /internal/stocks/deduct` 接口与机器可读 `code` | 修改 |
+  | `internal/order/{model,repository,service,handler}.go` | 订单新增 `pending_stock` 状态与 `order_outbox` 表；`Place` 从「同库事务」改成「本地事务 + outbox」 | 修改 |
+  | `cmd/server/main.go` | `PRODUCT_MODULE=0` 开关（只跳过路由注册）、补两张表的迁移、注入扣减客户端、起 `RetryLoop` | 修改 |
+  | `internal/shop/web/cart.html`、`internal/shop/web/index.html` | 结算文案改成 outbox 语义；`pending_stock` 显示「库存确认中…」并可刷新状态 | 修改 |
+  | `Makefile` | 新增 `make run-product` / `make build-product` | 修改 |
+
+- **这一章没有挖空**：用户明确要求「直接连带 outbox 一并修改」，所以由编码代理一次写完。
+  想自己练手的话，最值得重写一遍的是 `internal/inventory/deduct.go` 的 `ApplyDeduct`
+  （占坑与扣减为什么必须在同一个事务里）和 `internal/order/retry.go` 的 `retryOne`。
+
+- 环境变量（都只在「拆开跑」时需要）：
+
+  | 变量 | 谁读 | 默认 | 作用 |
+  | --- | --- | --- | --- |
+  | `PRODUCT_ADDR` | `cmd/product` | `:8084` | 商品服务监听地址 |
+  | `PRODUCT_MODULE` | `cmd/server` | 不设（= 开） | 设 `0` 时单体不注册 `/products`、`/stocks`、`/internal/stocks/deduct` |
+  | `PRODUCT_SERVICE_URL` | `cmd/server` | 由 `orderDefaultDeductURL()` 推出来 | 订单服务去哪个地址扣库存；设了 `PRODUCT_MODULE=0` 时默认 `http://127.0.0.1:8084` |
+  | `PRODUCT_SERVICE_TIMEOUT` | `cmd/server` | `3s` | 单次扣减调用的超时 |
+
+- 启动方式（两个终端）：
+
+  ```powershell
+  # 终端 1：商品服务
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  go run ./cmd/product          # 或：make run-product
+
+  # 终端 2：单体（让出商品 / 库存模块）
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  $env:PRODUCT_MODULE="0"
+  go run ./cmd/server
+  ```
+
+- 验收点：
+  1. `/products` 在 8080 → **404**，在 8084 → **200**（确认真的搬走了）；
+  2. 订单服务扣库存真的打到 8084（8084 的日志里能看到 `POST /internal/stocks/deduct`）；
+  3. **并发下单不超卖**：库存 N 的 SKU 同时来 M 笔单，成功的笔数**恰好**等于 N；
+  4. **人为停掉库存服务**：下单仍返回 **200**、订单是 `pending_stock`；把库存服务起回来，
+     几秒后订单自己变成 `pending`、库存被正确扣掉（不会静默丢单）；
+  5. 库存真的不够时返回 **409** + `code=insufficient_stock`，且**订单三张表都不留痕**；
+  6. 不设 `PRODUCT_MODULE` 时单体照旧能跑（回退路径有效）。
+
+- 实测记录（2026-10-15，同机跑 `:8080` + `:8084`）：
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净。
+  - 拆分生效：8080 `/products` → **404**，8084 `/products` → **200**；
+    `/internal/stocks/deduct` 空请求体 → **400 `bad_request`**。
+  - **并发不超卖（本阶段的核心指标）**：SKU 10 库存 **7**，用 PowerShell 并发打 **20** 笔
+    `quantity=1`、各自不同 `request_id` 的下单 → **200 恰好 7 个 / 409 恰好 13 个 / 其它 0 个**。
+    MySQL 复核：`stocks.quantity = 0`；这 20 个 `request_id` 在 `orders` 里**只有 7 行**；
+    `stock_deducts` 是 **applied 7 / rejected 13**；`order_outbox` 7 条全部 `done`，
+    **全表残留 `pending` 为 0**。另跑一轮 SKU 3（库存 5、12 并发）：同样 5 成功 / 7 冲突，库存 5 → 0。
+  - **停机补偿**：库存服务**不启动**时下单 `stage16-a-1`（SKU 3 × 2）→ **200** 且状态
+    `pending_stock`；`order_outbox` 是 `pending`、`attempts` 递增、`last_error` 写着
+    `connect refused`；此时 `stocks` 仍是 8（没有白扣）。启动 `bin/product` 后约 **8 秒**：
+    订单变 `pending`、便签 `done`（attempts=4）、`stocks` 8 → **6**、账本记 `applied`。
+  - **幂等**：同一个 `request_id` 重放下单 → 返回**同一张**订单（id 不变，不重复扣）；
+    直接重放内部接口 → **200 `applied`**，库存不再变化。
+  - **库存不足**：`stage16-b-2`（SKU 3 × 999）→ **409 `{"code":"insufficient_stock"}`**；
+    `orders` / `order_items` / `order_outbox` 三张表查出来都是 **0 行**（真的撤干净了）；
+    `stock_deducts` 里留一行 `rejected` 当证据。
+  - **trace 跨进程**：同一个 `X-Trace-Id: stage16-trace-check` 同时出现在单体日志
+    （`POST /orders status=409`）和商品服务日志（`POST /internal/stocks/deduct status=409`）。
+  - **回归**：`/shop`、`/shop/cart`、`/shop/seckill`、`/demo`、`/shop/data`、`/health` 全 **200**；
+    秒杀链路端到端照常（`demo2` 抢 item 49 → `queued`，3 秒后 `/shop/my` 出现订单 `pending`，
+    Redis 剩余 80 → 79）。
+  - **回退路径**：不设 `PRODUCT_MODULE` 的单体模式，`/products`、`/stocks/3` 都是 **200**，
+    下单直接 `pending`、便签 `done`（attempts=0）——老行为一点没变。
+
+- 遗留 / 不足（记下来，暂不改）：
+  - `order_outbox` 里 `done` 的记录**不会自动清理**，长期跑会越积越多（本项目量级下无所谓，
+    真上线要加「按时间清理」或者分区）。
+  - 库存服务的内部接口**没有鉴权**，只靠「网关不认识 `/internal` 前缀」挡着（外网 404）。
+    真上线要再加内网监听 / IP 白名单 / 内部 token。
+  - 补偿任务目前按「单实例」设计。`ClaimOutboxRetry` 的行锁 + 30 秒租约已经能保证
+    同一条便签不会被两个实例同时处理；但多实例下的批量扫描节奏还会重叠，量大了要再看。
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

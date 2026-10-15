@@ -1,4 +1,4 @@
-.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill run-product build-product env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -39,6 +39,22 @@ run-seckill:
 
 build-seckill:
 	go build -o bin/seckill ./cmd/seckill
+
+# 阶段 16：商品服务。把 internal/product + internal/inventory 搬成独立进程（默认 :8084）。
+# 要让它真正接管流量，需要三件事配合：
+#   1) 网关那边设 GATEWAY_UPSTREAM_PRODUCT=http://127.0.0.1:8084，
+#      网关才会把 /products、/stocks 转过来（网关代码一行都不用改）；
+#   2) 单体那边设 PRODUCT_MODULE=0，让它别再提供这两个模块的路由，
+#      同时订单服务的扣库存请求会自动改打 :8084（见 cmd/server/main.go 的
+#      orderDefaultDeductURL），不需要额外配置；
+#   3) 本服务不需要改鉴权配置 —— 它的所有接口本来就不需要登录。
+# 注意：/internal/stocks/deduct 是给订单服务用的内部接口，网关不认识 /internal 前缀，
+# 所以外网访问它只会 404；调试时可以直接打 http://127.0.0.1:8084/internal/stocks/deduct。
+run-product:
+	go run ./cmd/product
+
+build-product:
+	go build -o bin/product ./cmd/product
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d

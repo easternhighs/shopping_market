@@ -1,6 +1,9 @@
 package inventory
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 // ErrStockNotFound 表示库存记录不存在。
 var ErrStockNotFound = errors.New("库存记录不存在")
@@ -57,4 +60,28 @@ func (s *Service) Deduct(skuID uint, quantity int) (*Stock, error) {
 		return nil, err
 	}
 	return s.Get(skuID)
+}
+
+// DeductBatch 幂等地扣一批库存，供订单服务跨进程调用（阶段 16）。
+//
+// 它和上面的 Deduct 的区别：
+//   - Deduct 是「扣一个 SKU」，给单体自己的 /stocks/:sku_id/deduct 用，没人重试它；
+//   - DeductBatch 是「一单一起扣」，带一个 request_id 当幂等键。
+//     订单服务失败会重试，重试时带的还是同一个 request_id，
+//     所以这个方法重复调用一百次，库存也只扣第一次那一次。
+func (s *Service) DeductBatch(requestID string, items []DeductItem) error {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return errors.New("request_id 不能为空")
+	}
+	if len(items) == 0 {
+		return errors.New("items 不能为空")
+	}
+	for _, item := range items {
+		if item.Quantity <= 0 {
+			return errors.New("扣减数量必须大于 0")
+		}
+	}
+
+	return s.repo.ApplyDeduct(requestID, items)
 }

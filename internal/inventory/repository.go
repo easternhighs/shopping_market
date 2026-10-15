@@ -15,6 +15,9 @@ type Repository interface {
 	Deduct(skuID uint, quantity int) error
 	Create(s *Stock) error
 	DeductWithDB(db *gorm.DB, skuID uint, quantity int) error
+	// ApplyDeduct 幂等地扣掉一批库存（阶段 16）：同一个 request_id 只会真正生效一次。
+	// 订单服务跨进程调过来时用的就是它，重试多少次都不会多扣。
+	ApplyDeduct(requestID string, items []DeductItem) error
 }
 
 // repository 是接口的具体实现，用 GORM 操作 MySQL。
@@ -73,8 +76,13 @@ func (r *repository) Create(s *Stock) error {
 	return r.db.Create(s).Error
 }
 
-// DeductWithDB 在指定事务里扣减库存，供订单等需要“同事务”的场景使用。
-func (r *repository) DeductWithDB(db *gorm.DB, skuID uint, quantity int) error {
+// deductWithDB 是「在指定事务里扣一次库存」的公共实现。
+// 做成包级函数（而不是方法）：ApplyDeduct 和 DeductWithDB 都要用它，
+// 而它本身用不到 repository 的任何字段。
+//
+// 防超卖的那句还是老规矩：WHERE 里带 `quantity >= ?`，
+// 数据库保证「够才扣」，判断和扣减是同一条 SQL，中间没有任何缝隙。
+func deductWithDB(db *gorm.DB, skuID uint, quantity int) error {
 	result := db.Model(&Stock{}).
 		Where("sku_id = ? AND quantity >= ?", skuID, quantity).
 		Update("quantity", gorm.Expr("quantity - ?", quantity))
@@ -86,4 +94,14 @@ func (r *repository) DeductWithDB(db *gorm.DB, skuID uint, quantity int) error {
 		return ErrInsufficientStock
 	}
 	return nil
+}
+
+// DeductWithDB 在指定事务里扣减库存，供需要“同事务”的场景使用。
+//
+// 阶段 16 之后订单模块【已经不再调用它】了：库存在另一个进程里，不可能再共用一个事务
+// （订单改成「本地消息表 + 重试」，见 internal/order/outbox.go）。
+// 之所以留着它：① 单体自己的 `/stocks/:sku_id/deduct` 接口走的还是这套逻辑；
+// ② 万一要回退成「单体内部直接调用」，这里就是现成的入口。
+func (r *repository) DeductWithDB(db *gorm.DB, skuID uint, quantity int) error {
+	return deductWithDB(db, skuID, quantity)
 }

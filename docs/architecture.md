@@ -299,6 +299,7 @@ flowchart TB
 | POST | `/stocks` | 创建库存记录 |
 | GET | `/stocks/:sku_id` | 查库存 |
 | POST | `/stocks/:sku_id/deduct` | 扣库存 |
+| POST | `/internal/stocks/deduct` | **内部接口**：订单服务跨进程扣库存用（阶段 16）。体里带机器可读的 `code`（`applied` / `insufficient_stock` / `deduct_in_progress` / `internal_error`）。网关路由表里没有 `/internal` 前缀，所以从外网访问是 404 |
 
 **需要登录（请求头带 `Authorization: Bearer <token>`）**
 
@@ -407,7 +408,7 @@ flowchart LR
 - **对账任务**：兜底中的兜底。万一补偿也失败，30 秒内一定会用 MySQL 的账本把 Redis 修正回来。
 - **超时关单**：把「抢到不付钱」占住的库存还回商品池（阶段 9，详见 4.4）。
 
-这三者之间有一个必须注意的交叉点：关单要分两步（先 MySQL 后 Redis），
+秒杀这三个任务之间有一个必须注意的交叉点：关单要分两步（先 MySQL 后 Redis），
 两步之间 MySQL 的 `sold` 已经减了、Redis 库存还没加回来，**两边正好差这一份**。
 如果对账任务正好在这一瞬间跑，它会按 MySQL 反推、把这笔账算错。
 所以关单前后会给一个原子计数器 `inFlightExpiry` 加一/减一，
@@ -418,6 +419,39 @@ flowchart LR
 「超时点」到「6 小时前」之间，排序走 `created_at`——这三件事必须一起配合，
 才能用上 `(status, created_at)` 复合索引。少了索引，这个每 5 秒一次的小任务
 会退化成 440 万行全表扫描（实测每次 1.6~1.8 秒），扫描本身就是事故。
+
+### 8.2 普通下单的库存补偿（阶段 16）
+
+秒杀之外，普通下单在阶段 16 也多了第五个后台循环。背景是：下单不再是「一个事务同时写订单和
+扣库存」，而是**本地消息表（outbox）+ 跨进程扣减 + 后台补偿**——订单和库存分属两个进程之后，
+再没有数据库事务能把它们绑在一起。
+
+```mermaid
+flowchart LR
+    P["POST /orders"] --> T["本地事务：写 order(pending_stock)<br/>+ order_items + order_outbox 便签"]
+    T -->|提交后| D["同步调 POST /internal/stocks/deduct"]
+    D -->|成功| O1["订单 → pending，便签 → done"]
+    D -->|确定不够| O2["真删订单三张表，返回 409"]
+    D -->|说不清| O3["留在 pending_stock"]
+    O3 --> RP["RetryLoop：每 2 秒捞一轮<br/>Claim 租约 → 复查 → 重扣"]
+    RP -->|成功| O1
+    RP -->|确定不够 / 8 次用光| O4["关单 + 便签判 dead"]
+```
+
+- **为什么要有便签这层**：先把「欠库存一次扣减」和订单写在同一个本地事务里，
+  订单和欠条同生共死；跨进程那一跳无论怎么失败（超时、对方没起来），欠条都还在，
+  后台任务拿着欠条再试就行。反过来「先扣库存再写订单」，扣成功了订单没写成，
+  库存就白扣了且找不回来。
+- **为什么要幂等账本**：重试必然会重复调用。库存服务用 `stock_deducts` 表
+  （`request_id` 唯一）记住每笔扣减的结论，第二次来直接回上次的答案，绝不多扣。
+- **退避与上限**：1s → 2s → 4s …（封顶 60s），最多 8 次（`OutboxMaxAttempts`）；
+  用光或错误「修不好」就 `giveUp`：关单 + 便签判死 + 原因留在 `last_error` 里。
+  「放弃」不是「不管了」，而是把状态收拾干净，不让用户永远看到「确认中」。
+- **领取租约**：`ClaimOutboxRetry` 用行锁把一条便签「领走」并盖一个 30 秒的章，
+  多实例部署时同一条便签不会被两个进程同时处理。
+
+想现场看它工作，最直观的一招：**把商品服务停掉**再下单，页面会显示「订单已收下，正在确认库存」；
+把商品服务起回来，几秒后刷新就能看到它自己变成待付款，库存也扣掉了。
 
 `/metrics` 暴露的计数：`seckillRequests`、`seckillSuccess`、`seckillFailure`、
 `seckillDuplicate`、`rateLimited`。
@@ -510,19 +544,20 @@ HTTP 长连接、单机多实例 + 负载均衡。
 | 服务 | 拆出去的边界 | 拆分后需要额外处理的事 |
 | --- | --- | --- |
 | 用户服务（✅ 阶段 14 已落地） | `internal/user` | JWT 校验要么下沉到网关，要么各服务共享公钥 |
-| 商品 / 库存服务 | `internal/product`、`internal/inventory` | 库存归属唯一，避免两边同时改 |
-| 订单服务 | `internal/order`、`internal/seckill`（秒杀已在阶段 15 单独落地为 seckill-service） | 跨服务事务改用「本地消息表 + 最终一致」 |
+| 商品 / 库存服务（✅ 阶段 16 已落地） | `internal/product`、`internal/inventory` | 库存归属唯一，避免两边同时改；扣减改成跨进程内部接口 + 幂等账本（`stock_deducts`），订单侧用 outbox 补偿 |
+| 订单服务 | `internal/order`、`internal/seckill`（秒杀已在阶段 15 单独落地为 seckill-service） | 跨服务事务改用「本地消息表 + 最终一致」——✅ 阶段 16 已落地为 `order_outbox` + `RetryLoop`；`pending_stock` 就是这套机制的中间态 |
 | 支付服务 | `internal/payment` | 回调幂等、对账 |
 
 拆分后的代价要提前想清楚：**分布式事务、链路追踪、服务发现、配置中心**都得补上，
 所以现阶段保持单体是划算的——**先让单体跑满，再按真实瓶颈拆**，而不是一开始就拆。
 
-**目前已经落地了一部分**：阶段 13 抽出 `cmd/gateway`（`:8081`，旁路式，业务代码一行不改）、
-阶段 14 抽出 `cmd/user`（`:8082`）、阶段 15 抽出 `cmd/seckill`（`:8083`）。
-单体保留 `USER_MODULE` / `SECKILL_MODULE` 两个开关——设成 `0` 就让位（不再注册那部分路由、
-也不再跑对应的 Kafka 消费者和后台任务），不设变量就是原来那个单体，**随时可以回退**。
-拆分时刻意遵守一条纪律：**热点链路上一个跳数都不加**，限流 / 判重 / 预扣仍然在同一次 Redis Lua 往返里；
+阶段 14 抽出 `cmd/user`（`:8082`）、阶段 15 抽出 `cmd/seckill`（`:8083`）、
+阶段 16 抽出 `cmd/product`（`:8084`，含 `internal/inventory`）。
+单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` 三个开关——设成 `0` 就让位
+（不再注册那部分路由，秒杀那个还会连 Kafka 消费者和后台任务一起停），
+不设变量就是原来那个单体，**随时可以回退**。
 同机复测 1 万 QPS 无掉速（数字见 `docs/build.md` 阶段 15 与 `docs/microservices.md` 第 6 节）。
+阶段 16 拆商品/库存时也守了这条纪律：**普通下单多了一跳网络调用（约 1ms），但秒杀热路径一跳都没加**。
 
 ## 11. 数据库选型对比（为什么是 MySQL）
 

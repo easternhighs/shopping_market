@@ -4,8 +4,21 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 15 已完成**（拆 seckill-service）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务）到此收尾：`cmd/gateway` / `cmd/user` / `cmd/seckill` 三个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` 两个开关可以一键让位（不设变量就是原来那个单体）。下一步待定：可选继续拆 order / product，或回到单体做更深一层的性能优化
-- 本次完成：**只补文档，没有改代码** —— `docs/microservices.md` 新增第 11 节「从单体到微服务：改了什么 / 注意什么 / 会出什么问题（实操记录）」，并顺手修掉 5 处「现在还是单体」的过期表述（`docs/interview.md` 4 处 + 本文件第 10 节 1 处）
+- 当前阶段：**阶段 16 已完成**（拆 product-service + 剪断下单里那条同库事务）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务 → 16 商品/库存服务）走到第 4 步：`cmd/gateway` / `cmd/user` / `cmd/seckill` / `cmd/product` 四个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` 三个开关可以一键让位（不设变量就是原来那个单体）。下单扣库存从「同一个 MySQL 事务」改成「本地消息表 outbox + 跨进程同步扣减 + 后台补偿」，是本项目里唯一一条**真的跨进程、真的会短暂不一致、也真的会自己收敛**的链路。下一步待定：可选阶段 17（payment / cart 并入 order），或回到单体做更深一层的性能优化
+- 本次完成：**拆出 `cmd/product`（含 inventory），并把普通下单换成本地消息表（outbox）+ 后台补偿**（阶段 16 完成。用户明确授权「直接连带 outbox 一并修改」，所以这一章没有挖空，由代理一次写完）
+  - 搬家：新增 `cmd/product`（默认 `:8084`），`internal/product` + `internal/inventory` 整体搬过去；单体加 `PRODUCT_MODULE=0` 开关，**只跳过路由注册**（`productService` / `inventoryService` 变量仍在开关外，因为 `/demo`、`/shop` 要用）；`Makefile` 补 `run-product` / `build-product`
+  - 剪绳子：`order.Place` 从「一个事务同时写订单 + 扣库存」改成五步 —— ① 本地事务写 order（`pending_stock`）+ items + `order_outbox` 便签；② 事务提交后才跨进程调库存；③ 扣成功 → 订单 `pending` + 便签 `done`；④ 库存明确不够 → 真删三张表并返回 409；⑤ 说不清（对方没起来 / 超时）→ 留在 `pending_stock`，交给后台重试
+  - 幂等地基：`internal/inventory/deduct.go` 的 `ApplyDeduct` —— 先查账本 `stock_deducts` → 同一个事务里「先占坑（`request_id` 唯一索引）再按 SKU 排序扣减」→ 不够就记 `rejected` 并把占坑一起回滚；`ErrDeductInProgress` 表示「现在不知道结果，晚点再问」
+  - 接口契约：`POST /internal/stocks/deduct` 返回机器可读 `code`（200 `applied` / 409 `insufficient_stock` / 409 `deduct_in_progress` / 500 `internal_error`）；网关路由表没有 `/internal` 前缀，所以外网访问是 404
+  - 补偿任务：`RetryLoop`（每 2 秒一轮、挂 `runCtx`）→ `ClaimOutboxRetry`（行锁 + 30 秒租约）→ 复查订单状态 → 扣减 → 收尾；退避 1s / 2s / 4s …… 封顶 60s，8 次用光就 `giveUp`（关单 + 便签 `dead` + 原因留在 `last_error`）
+  - 前端：`cart.html` 结算文案改成 outbox 语义、`pending_stock` 显示「订单已收下，正在确认库存」+ 新增「刷新状态」按钮、隐藏「模拟支付」；`index.html` 订单列表加黄色 pill「库存确认中…」
+  - **实测（本阶段核心指标）**：SKU 10 库存 **7** 打 **20 并发** → **200 恰好 7 个 / 409 恰好 13 个 / 其它 0 个**；MySQL 复核 `stocks.quantity=0`、这 20 个 `request_id` 在 `orders` 里只有 **7 行**、`stock_deducts` applied 7 / rejected 13、`order_outbox` 7 条全 `done`、**全表残留 `pending` 为 0**。另一轮 SKU 3（库存 5、12 并发）同样 5 成功 / 7 冲突、库存 5 → 0
+  - 停机补偿：库存服务不启动时下单 → **200 `pending_stock`**，便签 `pending` + `attempts` 递增 + `last_error=connect refused`，`stocks` 没被白扣；把 `bin/product` 起回来约 **8 秒**后订单自己变 `pending`、便签 `done`（attempts=4）、库存 8 → 6
+  - 幂等 / 撤单：同一个 `request_id` 重放下单返回**同一张**订单；直接重放内部接口 200 `applied` 且库存不变；`sku3 × 999` → **409 `insufficient_stock`**，且 `orders` / `order_items` / `order_outbox` 三张表都是 **0 行**
+  - trace / 回归 / 回退：`X-Trace-Id` 同时出现在单体与商品服务的日志里；`/shop`、`/shop/cart`、`/shop/seckill`、`/demo`、`/shop/data`、`/health` 全 200，秒杀链路端到端照常；不设 `PRODUCT_MODULE` 的单体模式行为完全不变（下单直接 `pending`、便签 attempts=0）
+  - 文档产出：`docs/build.md` 新增「阶段 16」章节（状态机表、环境变量表、启动方式、6 条验收点、实测记录）；`docs/microservices.md` 路线表阶段 16 标完成、第 11 节补阶段 16 实操与实测；`docs/architecture.md` 补内部扣减接口与 outbox 后台任务说明；本文件补进度
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净
+- 上一轮完成：**只补文档，没有改代码** —— `docs/microservices.md` 新增第 11 节「从单体到微服务：改了什么 / 注意什么 / 会出什么问题（实操记录）」，并顺手修掉 5 处「现在还是单体」的过期表述（`docs/interview.md` 4 处 + 本文件第 10 节 1 处）
   - 内容：渐进式搬家三段（13 网关 → 14 user → 15 seckill）；网关四件事（路由表 / 公开私有名单 / 统一鉴权写 `X-User-Id` / 反向代理透传 trace）；单体两个让位开关（`USER_MODULE` / `SECKILL_MODULE` 管住什么）；`GATEWAY_UPSTREAM_*` 配置化上游
   - 8 条注意事项，每条都配本项目真实踩坑：热路径不能加跳、「不注册路由 ≠ 没在后台干活」（444 万条积压的僵尸消费者）、信任头默认关 + 网关先删伪造头、`Director`/`Rewrite` 只能留一个（否则全 502）、白名单要前缀匹配、`Queue.Settled()` 这类进程内计数器跨进程不成立 → 超卖、后台任务要挂 `runCtx`、鉴权失败要「响得对」不能「安静地错」（阶段 14 那三个缺陷）
   - 代价对照（延迟 / 一致性 / 故障面 / 部署 / 性能 / 开发效率）附「在本项目里具体长什么样」，并用大白话解释「最终一致」为什么不是 bug；实测段引用阶段 15 的 A/B 对照（单体 134,910 次 / p50 20.7ms vs 秒杀服务 134,876 次 / p50 20.6ms）与三档 QPS；末尾列 4 条遗留不足（限购 key 无 TTL、442 万 pending 单、`/shop` 仍进程内直调、阶段 16/17 未做）
@@ -212,3 +225,4 @@
 - [x] 阶段 14：拆 user-service（`cmd/user` 独立进程 + 双模式鉴权中间件 + `USER_MODULE` 开关 + 下游接 trace；2 处空已填、3 个缺陷已修、八步验证走通）
 
 - [x] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；4 处空已填、4 个缺陷已修、10 步验证走通，1 万 QPS 复测无掉速）
+- [x] 阶段 16：拆 product-service（`cmd/product` 含 inventory + `PRODUCT_MODULE` 开关 + 订单 outbox 补偿 / 退避重试 / 超限关单；用户授权直接实现、未挖空；6 项验收 + 20 并发不超卖实测走通）

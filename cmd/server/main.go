@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -52,10 +53,12 @@ func main() {
 		&product.Product{},
 		&product.SKU{},
 		&inventory.Stock{},
+		&inventory.DeductRecord{},
 		&cart.Cart{},
 		&cart.Item{},
 		&order.Order{},
 		&order.Item{},
+		&order.OrderOutbox{},
 		&payment.Payment{},
 		&seckill.Activity{},
 		&seckill.Item{},
@@ -125,17 +128,28 @@ func main() {
 		user.RegisterRoutes(r, userHandler, authMiddleware)
 	}
 
-	// 商品模块路由。
+	// 商品 + 库存模块装配（阶段 16）。
+	//
+	// 三段式：仓储 → 业务层 → HTTP 层，和别的模块一样。
+	// 注意这几个变量【不在】下面的开关里：/demo 和 /shop 两个页面还要直接用
+	// productService、inventoryService 去查数据（它们调的是函数，不是 HTTP 接口），
+	// 开关只控制「要不要把这些路由注册到这个进程上」。
 	productRepo := product.NewRepository(dbConn)
 	productService := product.NewService(productRepo)
 	productHandler := product.NewHandler(productService)
-	product.RegisterRoutes(r, productHandler)
 
-	// 库存模块路由。
 	inventoryRepo := inventory.NewRepository(dbConn)
 	inventoryService := inventory.NewService(inventoryRepo)
 	inventoryHandler := inventory.NewHandler(inventoryService)
-	inventory.RegisterRoutes(r, inventoryHandler)
+
+	// PRODUCT_MODULE=0 时【不】注册商品和库存路由（阶段 16 演示「真的拆出去了」用）：
+	//   - /products、/stocks 改由 cmd/product 那个独立进程提供，必须过网关才能访问；
+	//   - 内部接口 /internal/stocks/deduct 也跟着走 —— 订单服务按自己配的地址去扣库存。
+	// 默认（不设这个变量）仍然注册，保证「单体服务仍可单独启动」这条验收标准。
+	if os.Getenv("PRODUCT_MODULE") != "0" {
+		product.RegisterRoutes(r, productHandler)
+		inventory.RegisterRoutes(r, inventoryHandler)
+	}
 
 	// 需要登录的接口组。
 	protected := r.Group("/")
@@ -148,8 +162,13 @@ func main() {
 	cart.RegisterRoutes(protected, cartHandler)
 
 	// 订单模块路由。
+	//
+	// 阶段 16 起，订单服务不再直接拿 inventory.Repository：库存在另一个进程里，
+	// 「同一个事务里扣库存 + 建订单」那条路已经走不通了。
+	// 改成注入一个【跨服务的扣库存客户端】，具体打哪个地址见 orderDefaultDeductURL()，
+	// 也可以用环境变量 PRODUCT_SERVICE_URL 直接覆盖。
 	orderRepo := order.NewRepository(dbConn)
-	orderService := order.NewService(orderRepo, inventoryRepo)
+	orderService := order.NewService(orderRepo, order.DeductClientFromEnv(orderDefaultDeductURL(cfg.HTTP.Addr)))
 	orderHandler := order.NewHandler(orderService)
 	order.RegisterRoutes(protected, orderHandler)
 
@@ -275,6 +294,10 @@ func main() {
 	defer stopRun()
 	lagProbe.Start(runCtx)
 	go sampler.Run(runCtx)
+	// 启动库存补偿任务（阶段 16）：每 2 秒扫一遍 order_outbox 里「还没扣成功」的便签，
+	// 按退避时间重新去商品服务扣库存。没有它，一次网络抖动就会让订单永远卡在
+	// pending_stock —— 那是最不该发生的事：用户以为下单成功了，库存却一直没扣。
+	go orderService.RetryLoop(runCtx, order.RetryInterval)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {
@@ -340,6 +363,29 @@ func accessLog() gin.HandlerFunc {
 func healthHandler(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	c.String(http.StatusOK, `{"status":"ok"}`)
+}
+
+// orderDefaultDeductURL 决定「订单服务扣库存时，默认往哪儿打」——只在没设
+// PRODUCT_SERVICE_URL 时生效：
+//   - PRODUCT_MODULE=0：商品 / 库存已经让给 cmd/product 了，打它默认的 :8084；
+//   - 其它情况：单体自己就提供 /internal/stocks/deduct，打自己的监听端口。
+//
+// 为什么要多这一层：同一份 cmd/server 要同时支持「单体模式」和「拆开模式」。
+// 拆开时若还硬编码打 8080，8080 那边已经没有这个接口了（会 404），
+// 补偿任务会一直重试到次数用光、把订单白白关掉。
+//
+// selfAddr 是单体的监听地址（形如 ":8080"）。端口从它里面取，
+// 这样改了端口的部署也能对上；解析不出来就退回默认的 8080。
+func orderDefaultDeductURL(selfAddr string) string {
+	if os.Getenv("PRODUCT_MODULE") == "0" {
+		return "http://127.0.0.1:8084"
+	}
+
+	port := "8080"
+	if _, p, err := net.SplitHostPort(selfAddr); err == nil && p != "" {
+		port = p
+	}
+	return "http://127.0.0.1:" + port
 }
 
 // seckillPayTimeout 读取环境变量 SECKILL_PAY_TIMEOUT（例如 "20s"、"15m"），

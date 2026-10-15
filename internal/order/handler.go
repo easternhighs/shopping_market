@@ -1,6 +1,7 @@
 package order
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -25,21 +26,40 @@ func NewHandler(service *Service) *Handler {
 }
 
 // Place 处理 POST /orders。
+//
+// 传进去的是 c.Request.Context() 而不是别的：订单服务现在要跨进程调库存服务，
+// 这个 context 里带着两样关键东西——
+//   - trace id（中间件塞进去的）：传给下游，两边日志才能对上号；
+//   - 请求的超时与取消：用户关掉页面、网关超时，都会顺着它传到下游那次调用，
+//     不会出现「用户早走了，我们还在傻等库存服务」。
 func (h *Handler) Place(c *gin.Context) {
 	userID := c.GetUint(contextUserID)
 
 	var req placeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误", "code": "bad_request"})
 		return
 	}
 
-	o, err := h.service.Place(userID, req.RequestID, req.Items)
+	o, err := h.service.Place(c.Request.Context(), userID, req.RequestID, req.Items)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		switch {
+		case errors.Is(err, ErrStockInsufficient):
+			// 库存不够是【业务上的正常结果】，不是服务器故障，所以用 409
+			//（冲突：你想要的库存状态和现实冲突了），而不是 500。
+			// 带上机器可读的 code，前端就不用去猜中文文案。
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "insufficient_stock"})
+		case errors.Is(err, ErrInvalidArgument):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "bad_request"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
 		return
 	}
 
+	// 注意这里返回的订单状态可能是 pending，也可能是 pending_stock：
+	// 后者表示「订单已经收下了，但库存还在确认中，后台会自动重试」。
+	// 这不是失败，所以状态码仍然是 200——静默丢单才是失败。
 	c.JSON(http.StatusOK, gin.H{"order": o})
 }
 

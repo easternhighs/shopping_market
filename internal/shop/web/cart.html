@@ -174,9 +174,10 @@ function cartTotal() {
    为什么要一个 request_id：服务端拿它做幂等键。同一次提交重复发出去（网络抖动重试、
    用户连点两下）只会产生一笔订单，不会重复扣库存。
 
-   注意接口返回的 order.id 是数据库当场生成的真实订单号。秒杀那边完全相反 ——
-   抢购接口先返回 id=0，要等 Kafka 消费者落库之后才查得到：这里走的是同步事务，
-   秒杀把落库这一步丢给了消息队列。 */
+   注意接口返回的 order.id 是数据库当场生成的真实订单号（订单和明细在本地事务里先落库）。
+   秒杀那边完全相反 —— 抢购接口先返回 id=0，要等 Kafka 消费者落库之后才查得到。
+   阶段 16 起，这张订单的状态还可能是 pending_stock：订单落库了，但跨进程扣库存还没成功，
+   后台补偿任务会自动重试，所以这一页要允许用户「刷新状态」看它变成待付款。 */
 async function placeOrder() {
   if (!token) { flash("请先登录", false); return; }
   if (cartItems.length === 0) { flash("购物车是空的，没有可提交的商品", false); return; }
@@ -195,7 +196,20 @@ async function placeOrder() {
   orderResult = r.data.order;
   checkoutOpen = false;
   await refreshCart();
-  flash("下单成功，订单号 #" + orderResult.id, true);
+  flash(orderResult.status === "pending_stock"
+    ? "订单已收下（#" + orderResult.id + "），库存确认中，稍后刷新即可"
+    : "下单成功，订单号 #" + orderResult.id, true);
+}
+
+/* 刷新订单状态：只在 pending_stock 时用得到 —— 后台补偿任务把库存扣好之后，
+   订单会从 pending_stock 变成 pending。这里重新拉一次 GET /orders/:id 就能看到。 */
+async function refreshOrderStatus(orderID) {
+  const r = await api("/orders/" + orderID, { auth: true });
+  if (!r.ok) { flash("刷新失败：HTTP " + r.status + " " + (r.data.error || ""), false); return; }
+
+  orderResult = r.data.order;
+  render();
+  flash(orderResult.status === "pending_stock" ? "还在确认库存，请再等一会儿" : "库存已确认，可以付款了", true);
 }
 
 /* 模拟支付：把订单状态从 pending 改成 paid（POST /orders/:id/pay）。
@@ -423,7 +437,10 @@ function renderCheckout() {
       '<button class="ghost" id="backBtn">返回购物车</button>' +
     '</div>' +
     '<p class="hint" style="margin:12px 0 0">点「提交订单」会调 <code>POST /orders</code>：' +
-    '它在<b>一个 MySQL 事务</b>里扣库存 + 建订单 + 写明细，中间任何一步失败就整体回滚。' +
+    '它先在<b>一个本地事务</b>里写下订单、明细和一张「待扣库存」的便签（outbox），' +
+    '提交之后才跨进程去商品服务扣库存（阶段 16 起库存已经拆成独立服务）。' +
+    '扣成功订单才算「待付款」；扣不动就先挂成「库存确认中」，' +
+    '由后台任务按 1s、2s、4s…… 的退避节奏自动重试，绝不会静默丢单。' +
     '这是和秒杀最本质的区别 —— 秒杀不在数据库里排队，先在 Redis 扣、再丢进 Kafka 慢慢落库。</p>' +
   '</div>';
 }
@@ -431,6 +448,9 @@ function renderCheckout() {
 function renderOrderResult() {
   const o = orderResult;
   const paid = o.status === "paid";
+  /* 库存确认中：订单 + 明细 + outbox 便签已经落库了，但跨进程扣库存还没成功。
+     它不是失败（真失败会返回 409 并把订单整条撤掉），是「稍等一下就好」的中间态。 */
+  const stockPending = o.status === "pending_stock";
   const snap = lastSubmit || { items: [], total: 0 };
 
   const rows = snap.items.map(function (it) {
@@ -442,7 +462,8 @@ function renderOrderResult() {
   }).join('');
 
   return '<div class="panel">' +
-    '<h2>' + (paid ? '✅ 支付完成' : '🧾 订单已创建，等待支付') + '</h2>' +
+    '<h2>' + (paid ? '✅ 支付完成'
+      : (stockPending ? '🧾 订单已收下，正在确认库存' : '🧾 订单已创建，等待支付')) + '</h2>' +
     '<p class="hint">订单号 <b>#' + o.id + '</b> · 状态 <b>' + esc(o.status) + '</b> · ' +
     '下单时间 ' + esc(o.created_at) + '<br />' +
     'request_id <code>' + esc(o.request_id) + '</code>（服务端靠它做幂等：同一个 request_id 重复提交只会有一笔订单）</p>' +
@@ -451,10 +472,14 @@ function renderOrderResult() {
     '<div class="totals">' +
       '合计&nbsp;<span class="sum">' + money(snap.total) + '</span>' +
       '<span style="flex:1"></span>' +
-      (paid ? '' : '<button id="payBtn">模拟支付</button>') +
+      (stockPending ? '<button class="ghost" id="refreshOrderBtn">刷新状态</button>' : '') +
+      (paid || stockPending ? '' : '<button id="payBtn">模拟支付</button>') +
       '<a class="btn ghost" href="/shop">继续购物</a>' +
     '</div>' +
-    '<p class="hint" style="margin:12px 0 0">注意这个订单号是<b>数据库当场生成</b>的真实 ID。' +
+    '<p class="hint" style="margin:12px 0 0">' +
+    (stockPending ? '这单现在挂在 <b>pending_stock</b>：订单已经写进数据库了，但扣库存那一步还没打通。' +
+      '后台补偿任务每 2 秒会照着一张 outbox 便签重试一次，成功后页面刷新就会变成「待付款」。<br />' : '') +
+    '注意这个订单号是<b>数据库当场生成</b>的真实 ID。' +
     '对比一下秒杀：那边抢购接口先返回 <code>id=0</code>，要等 Kafka 消费者把订单写进 MySQL 之后才查得到 —— ' +
     '同步事务和异步落库的区别，一眼就看出来了。<br />' +
     '另外 <code>orders</code> 表里没有金额列，金额只是页面算给你看的：真要对账，' +
@@ -530,6 +555,15 @@ function bind() {
       await payOrder(orderResult.id);
     } catch (e) {
       flash("支付失败：" + e, false);
+    }
+  };
+
+  const refreshOrder = $("refreshOrderBtn");
+  if (refreshOrder) refreshOrder.onclick = async function () {
+    try {
+      await refreshOrderStatus(orderResult.id);
+    } catch (e) {
+      flash("刷新失败：" + e, false);
     }
   };
 }

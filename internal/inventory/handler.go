@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -14,6 +15,12 @@ type createStockRequest struct {
 
 type deductRequest struct {
 	Quantity int `json:"quantity" binding:"required"`
+}
+
+// deductBatchRequest 是订单服务跨进程调过来的请求体（POST /internal/stocks/deduct）。
+type deductBatchRequest struct {
+	RequestID string       `json:"request_id" binding:"required"`
+	Items     []DeductItem `json:"items" binding:"required"`
 }
 
 // Handler 是库存模块的 HTTP 层。
@@ -89,4 +96,37 @@ func (h *Handler) DeductStock(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"stock": stock})
+}
+
+// DeductBatchStock 处理 POST /internal/stocks/deduct：订单服务跨进程来扣库存。
+//
+// 为什么返回体里要带一个机器可读的 code，而不是只有一句中文 error：
+// 调用方（订单服务）要根据「库存不足」和「稍后重试」做完全不同的处理 ——
+// 前者作废订单，后者留着继续重试。靠匹配中文文案来判断，改一个字就悄悄失效了。
+// code 是两份代码之间的契约，error 才是给人看的。
+func (h *Handler) DeductBatchStock(c *gin.Context) {
+	var req deductBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误", "code": "bad_request"})
+		return
+	}
+	for _, item := range req.Items {
+		if item.Quantity <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "扣减数量必须大于 0", "code": "bad_request"})
+			return
+		}
+	}
+
+	err := h.service.DeductBatch(req.RequestID, req.Items)
+	switch {
+	case err == nil:
+		// 幂等重放也走这里：同一个 request_id 第二次来，我们回的还是「成功」。
+		c.JSON(http.StatusOK, gin.H{"status": DeductApplied, "request_id": req.RequestID})
+	case errors.Is(err, ErrInsufficientStock):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "insufficient_stock"})
+	case errors.Is(err, ErrDeductInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "deduct_in_progress"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "code": "internal_error"})
+	}
 }

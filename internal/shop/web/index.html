@@ -441,7 +441,11 @@ function renderOrders() {
   const rows = myOrders.map((o) => {
     const status = o.status === "pending"
       ? '<span class="pill warn">待付款' + esc(payLeftText(o)) + '</span>'
-      : (o.status === "paid" ? '<span class="pill ok">已支付</span>' : '<span class="pill bad">已取消</span>');
+      : (o.status === "pending_stock"
+        /* 库存确认中：订单已经写进库了，只是扣库存那一步还没成功（阶段 16 的中间态）。
+           它不该落到「已取消」那一支 —— 那会让人以为单子没了。 */
+        ? '<span class="pill warn">库存确认中…</span>'
+        : (o.status === "paid" ? '<span class="pill ok">已支付</span>' : '<span class="pill bad">已取消</span>'));
 
     return '<tr>' +
       '<td>#' + o.id + '</td>' +

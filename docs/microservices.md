@@ -79,6 +79,10 @@ if err := s.inventory.DeductWithDB(tx, item.SKUID, item.Quantity); err != nil {
 要么都成功、要么都回滚。这是 ACID 给的免费午餐 —— 一旦库存变成另一个进程、另一个库，
 这顿饭就没了，必须自己补一套「怎么保证两边都不出错」的机制（第 5.3 节）。
 
+> **阶段 16 已落地**：这条绳子已经剪断——`order.Place` 改成「本地消息表 outbox + 跨进程扣减 +
+> 后台退避重试」，上面的代码片段与 `DeductWithDB(tx, ...)` 是**拆之前的样子**，留在这里当对照。
+> 具体怎么替代的见第 5.3 节的落地记录与第 11.6 节。
+
 ### 3.2 一键造数据：一次写四个模块的表
 
 `internal/demo/handler.go` 第 76 行注册的 `POST /demo/seed`，会连着往 `users`、`products`、
@@ -180,6 +184,18 @@ flowchart LR
 
 这样至少保证**不会超卖**（扣减在库存服务一侧是原子的），代价是下单延迟多一次内网 RPC（约 1 毫秒量级）。
 
+**阶段 16 落地记录（已完成）**：实际做法与上面第 1~4 步基本一致，落地时改了两处细节：
+
+- 表名就叫 `order_outbox`（`request_id` 唯一索引、`payload` 存 JSON、`status` 取
+  `pending` / `done` / `cancelled` / `dead`、`attempts` + `next_retry_at` 管退避、`last_error` 留证据）；
+- 状态名用的是 **`pending_stock`**（订单已收下、库存待确认）而不是草稿里的 `pending_pay`；
+  扣成功才变 `pending`，库存不够或重试超限则变 `cancelled`，用户侧看到的是「确认中」而不是失败。
+
+另外补了一条草稿里没写的关键机制：**库存服务侧的幂等账本**（`stock_deducts` 表 +
+`ApplyDeduct`）。没有它，「重试」就等于「重复扣库存」——这是剪断事务之后最容易踩的坑。
+实测（SKU 库存 7、20 并发下单）：200 恰好 7 个 / 409 恰好 13 个，库存扣到 0，
+`orders` 只有 7 行、账本 applied 7 / rejected 13、便签全部 `done`。详见第 11.6 节。
+
 ### 5.4 幂等与跨服务对账
 
 跨服务后网络会重试、消息会重复投递，**每个写操作都必须幂等**。好消息是这个项目已经把幂等键准备好了：
@@ -217,7 +233,7 @@ flowchart LR
 | 13（已完成） | 抽出 gateway（同进程旁路模式）：先加一层网关，但**业务代码一行不改**，压测仍然直连 8080 | `make run-gateway` 起来后，走 8081 的每次请求都能拿到 `X-Trace-Id`；未登录访问 `/me` 被网关拦下（401） |
 | 14（已完成） | 拆 user-service：把 `internal/user` 搬成独立进程，网关把 `/login` `/register` `/me` 转过去 | 网关透传登录后，`/cart/items` 等受保护接口照常工作；单体服务仍可单独启动 |
 | 15（已完成） | 拆 seckill-service：搬 `internal/seckill`（含消费者、对账、Redis Lua、Kafka 生产端） | **复测 1 万 QPS**，确认拆进程后热路径没有掉速——实测 128 / 256 / 512 VU 约 **10.5k / 11.2k / 11.5k QPS**，A/B 对照单体 134,910 次 vs 秒杀服务 134,876 次（p50 20.7ms vs 20.6ms），**无掉速** |
-| 16 | 拆 product-service（含 inventory），并改造 order 里那条同库事务（第 5.3 节） | 并发下单不超卖；人为把库存服务停掉，订单能正确进入「库存待确认」并被重试，不会静默丢单 |
+| 16（已完成） | 拆 product-service（含 inventory），并改造 order 里那条同库事务（第 5.3 节）：本地消息表 + 跨进程扣减 + 后台补偿 | 并发下单不超卖——SKU 库存 7 打 **20 并发**，**200 恰好 7 / 409 恰好 13**、库存扣到 0、`orders` 只有 7 行、账本 applied 7 / rejected 13、便签无残留 `pending`；人为停掉库存服务，订单进入 `pending_stock` 并被打上重试，起回来约 8 秒后自动变 `pending` 且库存正确扣减 |
 | 17 | payment / cart 并入 order-service，console 独立；补跨服务对账与 trace 打通 | 全链路一次下单能在日志里按同一个 trace id 串起来 |
 
 阶段 13 之所以用「**旁路式**」：新增 8081 端口，`cmd/server/main.go` 一个字都不动。
@@ -350,7 +366,7 @@ flowchart LR
 | 维度 | 单体 | 拆开之后 | 本项目实际见到的 |
 | --- | --- | --- | --- |
 | 延迟 | 一次函数调用 | 每跳多 1~3 次网络往返（同机约 0.3~1ms） | 秒杀没加跳，所以热路径几乎没变化 |
-| 一致性 | 一个 MySQL 事务，要么全成要么全不成 | 变成**最终一致** | 下单扣库存那条同库事务拆不掉，要留到阶段 16 |
+| 一致性 | 一个 MySQL 事务，要么全成要么全不成 | 变成**最终一致** | 下单扣库存那条同库事务阶段 16 已拆掉（本地消息表 + 重试），中间态 `pending_stock` 就是「最终一致」在页面上的样子 |
 | 故障面 | 挂了全挂，但原因单一 | 只影响一部分 | 多进程之后必须靠 trace 串日志，否则不知道错在哪一环 |
 | 部署 | 一个二进制 | 6 个进程 | 用环境变量 + 固定端口顶着，本项目明确不上服务发现 |
 | 性能 | 同机跑最省 CPU | 同机多进程抢 CPU，**通常比单体 QPS 更低** | 阶段 15 实测**没掉速**，因为没加跳数（见 11.5） |
@@ -377,9 +393,45 @@ flowchart LR
 结论要说清楚：**「拆完没掉速」不是微服务更快，而是这次搬家没给热路径加跳数。**
 换成多机部署才有可能真正更快；同机拆服务通常只会更慢。
 
-### 11.6 还欠着的地方（主动说，别等被问）
+### 11.6 阶段 16 实测：并发不超卖与停机补偿
+
+阶段 16 把「写订单 + 扣库存」那笔同库事务剪断，换成**本地消息表（outbox）+ 跨进程同步扣减 +
+后台退避重试**。这一节的数字就是「剪断之后还准不准」的答案。
+
+**并发不超卖（核心指标）**：SKU 10 库存 **7**，并发打 **20** 笔 `quantity=1`、
+各自不同 `request_id` 的下单：
+
+| 结果 | 笔数 |
+| --- | --- |
+| 200（下单成功、库存已扣） | **7** |
+| 409 `insufficient_stock` | **13** |
+| 其它（500 / 超时 / 重复扣） | **0** |
+
+MySQL 复核：`stocks.quantity = 0`；这 20 个 `request_id` 在 `orders` 里**只有 7 行**；
+`stock_deducts` 是 **applied 7 / rejected 13**；`order_outbox` 7 条全部 `done`；
+**全表残留 `pending` 为 0**。另一轮 SKU 3（库存 5、12 并发）同样 5 成功 / 7 冲突。
+
+**停机补偿（不静默丢单）**：把库存服务停掉再下单 → 仍然返回 **200**，订单状态是 `pending_stock`；
+`order_outbox` 里便签 `pending`、`attempts` 递增、`last_error` 写着 `connect refused`，
+此时 `stocks` **没有被白扣**。把库存服务起回来约 **8 秒**后：订单自动变 `pending`、
+便签 `done`、库存从 8 扣到 6、账本记 `applied`。
+
+**幂等与撤单**：同一个 `request_id` 重放下单返回同一张订单（不会重复扣）；
+直接重放内部接口 `POST /internal/stocks/deduct` 返回 200 `applied` 且库存不再变化；
+库存真的不够时（`sku3 × 999`）返回 **409 `{"code":"insufficient_stock"}`**，
+并且 `orders` / `order_items` / `order_outbox` 三张表**一行都不留**。
+
+**trace 跨进程**：同一个 `X-Trace-Id` 同时出现在单体的 `POST /orders status=409` 与
+商品服务的 `POST /internal/stocks/deduct status=409` 两条日志里——阶段 13 搭的骨架在这一跳真的用上了。
+
+一句话总结：**剪断事务并没有换来「不确定」，它换来的是「有中间态、但一定会收敛」。**
+代价是多了一次约 1 毫秒的内网调用，以及一套必须自己写的重试补偿代码。
+
+### 11.7 还欠着的地方（主动说，别等被问）
 
 - 限购 key `seckill:item:<id>:user:<uid>` **没有 TTL**，压测把 Redis 顶到过 713 万个 key；
 - MySQL 里还有约 **442 万条**历史 pending 订单，会拖慢 `ExpireLoop`（每轮只处理 200 笔）；
 - `internal/shop/handler.go` 仍在单体进程内**直接函数调用**秒杀服务（演示页面刻意保留，不值得为它绕一圈 HTTP）；
-- 阶段 16（product-service，含拆掉那条同库事务）、阶段 17（payment / cart 并入 order）还没做，见第 6 节。
+- `order_outbox` 里 `done` 的记录不会自动清理；库存服务的内部接口 `/internal/stocks/deduct`
+  只靠「网关不认识 `/internal` 前缀」挡着（外网 404），真上线还要加内网监听 / IP 白名单；
+- 阶段 17（payment / cart 并入 order、console 独立）还没做，见第 6 节。
