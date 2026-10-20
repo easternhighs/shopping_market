@@ -113,12 +113,19 @@ func (s *Service) Place(ctx context.Context, userID uint, requestID string, item
 			return err
 		}
 
+		// 便签的「首次可重试时间」故意往后推 2 个扫描周期（默认 2s × 2 = 4s）。
+		// 原因：事务一提交，下面的 settleStock 就会马上去扣库存，最长可能等到
+		// PRODUCT_SERVICE_TIMEOUT（默认 3 秒）。如果便签初始时间就是「现在」，
+		// 后台 RetryLoop 可能在这次同步调用还没返回时就抢到同一张便签，于是同一张订单
+		// 被两条路径同时判定：同步路径说「库存不足」→ 撤单删行；后台路径若看到库存
+		// 又够了 → 把订单改成 pending。客户端收到 409，库里却留着一张待付款订单。
+		// 推后到 4s（> 3s 超时）之后，后台只会接手「同步路径已经放弃或进程崩了」的便签。
 		return s.repo.CreateOutbox(tx, &OrderOutbox{
 			RequestID:   requestID,
 			UserID:      userID,
 			Payload:     payload,
 			Status:      OutboxPending,
-			NextRetryAt: time.Now(),
+			NextRetryAt: time.Now().Add(2 * RetryInterval),
 		})
 	}); err != nil {
 		return nil, err
@@ -205,10 +212,10 @@ func (s *Service) Get(id uint) (*Order, []Item, error) {
 
 // Pay 把订单状态改成 paid。
 //
-// 只允许「pending」（库存已确认）的订单付款：
+// 只允许「pending」（库存已确认）的订单真正改状态：
 // 「pending_stock」（库存还没确认）的订单连库存都不一定占住了，
 // 让它付款等于卖给用户一件可能不存在的货；
-// 「cancelled」「paid」自然也不该再付一次。
+// 「cancelled」拒绝；「paid」当作幂等成功，专门给重复支付回调留一条活路。
 func (s *Service) Pay(orderID uint) error {
 	o, err := s.repo.FindByID(orderID)
 	if err != nil {
@@ -216,6 +223,14 @@ func (s *Service) Pay(orderID uint) error {
 	}
 	if o == nil {
 		return ErrOrderNotFound
+	}
+
+	// 已经付过款就直接返回成功，让 Pay 变成幂等操作。
+	// 支付模块的顺序是「先改订单状态、再写支付流水」；如果进程刚好在两步之间退出，
+	// 第三方重发回调时会先看到流水仍是 pending，再调一次 Pay。
+	// 这里若返回「状态不允许」，流水就永远补不成 paid；返回成功则第二次能把流水写完。
+	if o.Status == StatusPaid {
+		return nil
 	}
 
 	if o.Status != StatusPending {

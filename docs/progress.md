@@ -4,8 +4,21 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 16 已完成**（拆 product-service + 剪断下单里那条同库事务）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务 → 16 商品/库存服务）走到第 4 步：`cmd/gateway` / `cmd/user` / `cmd/seckill` / `cmd/product` 四个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` 三个开关可以一键让位（不设变量就是原来那个单体）。下单扣库存从「同一个 MySQL 事务」改成「本地消息表 outbox + 跨进程同步扣减 + 后台补偿」，是本项目里唯一一条**真的跨进程、真的会短暂不一致、也真的会自己收敛**的链路。下一步待定：可选阶段 17（payment / cart 并入 order），或回到单体做更深一层的性能优化
-- 本次完成：**拆出 `cmd/product`（含 inventory），并把普通下单换成本地消息表（outbox）+ 后台补偿**（阶段 16 完成。用户明确授权「直接连带 outbox 一并修改」，所以这一章没有挖空，由代理一次写完）
+- 当前阶段：**阶段 17 已完成**（拆 order-service：订单 + 购物车 + 支付）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务 → 16 商品/库存服务 → 17 订单服务）走到第 5 步：`cmd/gateway` / `cmd/user` / `cmd/seckill` / `cmd/product` / `cmd/order` 五个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` / `ORDER_MODULE` 四个开关可以一键让位（不设变量就是原来那个单体）。还留在单体里的是 `/shop` 和 `/demo` 两块旁路页面——`/demo` 目前直接调用各模块的 Service 对象（进程内函数调用），这是阶段 18 的主要工作
+- 本次完成：**拆出 `cmd/order`（订单 + 购物车 + 支付），单体加 `ORDER_MODULE` 开关**（阶段 17 完成）
+  - 搬家：新增 `cmd/order`（默认 `:8085`），`internal/order` + `internal/cart` + `internal/payment` 三块一起搬过去；`AutoMigrate` 六张表（`orders` / `order_items` / `order_outbox` / `carts` / `cart_items` / `payments`）；全部路由挂鉴权；库存补偿 `RetryLoop` 跟着搬到这个进程；`Makefile` 补 `run-order` / `build-order`
+  - 边界判断（面试重点）：`payments` 表依赖订单，购物车与订单共享用户边界和购买流程；三块同库同进程，支付能直接调订单，**一次付款不产生跨服务网络往返**。硬拆成三个服务就要跨两次网络，超时、重试、乱序都得自己兜底。结论：**微服务边界按「数据归属 + 一致性要求」划，不是越细越好**
+  - 单体开关：`ORDER_MODULE=0` 时**不注册** `/orders`、`/cart`、`/payments` 三组路由，也**不启动** `RetryLoop`；不设变量时行为与阶段 16 完全一致（回退路径有效）
+  - 网关：路由表早就写好了 `/cart`、`/orders`、`/payments` → `order`，这一章只需 `GATEWAY_UPSTREAM_ORDER=http://127.0.0.1:8085`，**网关代码一行没改**
+  - **实测（本阶段核心指标）**：8080 的 `/orders`、`/cart/items`、`/payments/1` 全 **404**；8085 不带用户头 **401**；SKU 3 库存 **8** 打 **20 并发** → **200 恰好 8 / 409 恰好 12 / 其它 0**，`stocks.quantity=0`、`orders` 只多 8 行（7 `pending` + 1 `paid`）、`order_outbox` 8 条全 `done`、库存不足的订单三张表**一行不留**；支付 `pending` → `paid`
+  - **经网关**：`/healthz` 200；不带 token 下单 401；登录后 `/cart/items` 200、`POST /orders` 200（`user_id=15`，证明网关注入的 `X-User-Id` 生效）；`X-Trace-Id` 在网关 / 订单 / 商品三份日志里是**同一个值**
+  - **并发隐患（本轮发现并已修）**：`order_outbox.next_retry_at` 初始化成了「现在」，后台 `RetryLoop` 可能在同步扣减还没返回时就抢到同一张便签；日志出现「已关单 order=62」但库里没有 62。更坏的交错会让客户端收到 409、库里却留一张待付款订单。修法：首次可重试时间推后 `2 × RetryInterval`（默认 4s > 3s 扣减超时），后台只接手「同步路径已放弃 / 进程崩了」的便签
+  - **支付幂等（本轮顺带补）**：支付顺序是「先改订单状态、再写支付流水」，进程若在两步之间退出，回调重试时订单已是 `paid`。原实现会报「状态不允许」，流水永远补不成；现在 `Pay` 对「已付款」直接返回成功，第二次回调能把流水写完。实测连续两次回调均 **200**、`payments` 只有一条流水；模拟「订单已 paid、流水仍 pending」也能一次补齐
+  - 回归：`/health`、`/shop`、`/shop/seckill`、`/shop/cart`、`/shop/data`、`/demo`、`/demo/data` 全 **200**；秒杀端到端照常（`demo2` 抢 item 52 → `queued`，3 秒后落库 `pending`，`sold` 0 → 1）
+  - 文档产出：`docs/build.md` 新增「阶段 17」章节（服务边界表、环境变量表、四终端启动方式、7 条验收点、实测记录）；`docs/microservices.md` 路线表阶段 17 标完成并补 11.6；`docs/architecture.md` 补订单服务归属与 `ORDER_MODULE` 开关；`docs/interview.md` 补服务边界问答；本文件补进度
+  - 数据清理：阶段 17 验证产生的 `stage17-*` 订单 / 明细 / 便签 / 扣减账本 / 秒杀订单已全部删除，`stocks.sku3` 恢复 8、`sku16` 恢复 100000，秒杀商品 52 的 `sold` 归 0、Redis 库存恢复 30
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净
+- 上一轮完成：**拆出 `cmd/product`（含 inventory），并把普通下单换成本地消息表（outbox）+ 后台补偿**（阶段 16 完成。用户明确授权「直接连带 outbox 一并修改」，所以这一章没有挖空，由代理一次写完）
   - 搬家：新增 `cmd/product`（默认 `:8084`），`internal/product` + `internal/inventory` 整体搬过去；单体加 `PRODUCT_MODULE=0` 开关，**只跳过路由注册**（`productService` / `inventoryService` 变量仍在开关外，因为 `/demo`、`/shop` 要用）；`Makefile` 补 `run-product` / `build-product`
   - 剪绳子：`order.Place` 从「一个事务同时写订单 + 扣库存」改成五步 —— ① 本地事务写 order（`pending_stock`）+ items + `order_outbox` 便签；② 事务提交后才跨进程调库存；③ 扣成功 → 订单 `pending` + 便签 `done`；④ 库存明确不够 → 真删三张表并返回 409；⑤ 说不清（对方没起来 / 超时）→ 留在 `pending_stock`，交给后台重试
   - 幂等地基：`internal/inventory/deduct.go` 的 `ApplyDeduct` —— 先查账本 `stock_deducts` → 同一个事务里「先占坑（`request_id` 唯一索引）再按 SKU 排序扣减」→ 不够就记 `rejected` 并把占坑一起回滚；`ErrDeductInProgress` 表示「现在不知道结果，晚点再问」
@@ -226,3 +239,4 @@
 
 - [x] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；4 处空已填、4 个缺陷已修、10 步验证走通，1 万 QPS 复测无掉速）
 - [x] 阶段 16：拆 product-service（`cmd/product` 含 inventory + `PRODUCT_MODULE` 开关 + 订单 outbox 补偿 / 退避重试 / 超限关单；用户授权直接实现、未挖空；6 项验收 + 20 并发不超卖实测走通）
+- [x] 阶段 17：拆 order-service（`cmd/order` 含 order + cart + payment，`:8085`；单体 `ORDER_MODULE` 开关；网关一个环境变量接管三组路由；20 并发不超卖、支付流转、三进程 trace 同 id 实测走通；顺手修掉补偿与同步扣减抢同一张便签的隐患）

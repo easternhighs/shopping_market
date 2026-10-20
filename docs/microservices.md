@@ -234,7 +234,7 @@ flowchart LR
 | 14（已完成） | 拆 user-service：把 `internal/user` 搬成独立进程，网关把 `/login` `/register` `/me` 转过去 | 网关透传登录后，`/cart/items` 等受保护接口照常工作；单体服务仍可单独启动 |
 | 15（已完成） | 拆 seckill-service：搬 `internal/seckill`（含消费者、对账、Redis Lua、Kafka 生产端） | **复测 1 万 QPS**，确认拆进程后热路径没有掉速——实测 128 / 256 / 512 VU 约 **10.5k / 11.2k / 11.5k QPS**，A/B 对照单体 134,910 次 vs 秒杀服务 134,876 次（p50 20.7ms vs 20.6ms），**无掉速** |
 | 16（已完成） | 拆 product-service（含 inventory），并改造 order 里那条同库事务（第 5.3 节）：本地消息表 + 跨进程扣减 + 后台补偿 | 并发下单不超卖——SKU 库存 7 打 **20 并发**，**200 恰好 7 / 409 恰好 13**、库存扣到 0、`orders` 只有 7 行、账本 applied 7 / rejected 13、便签无残留 `pending`；人为停掉库存服务，订单进入 `pending_stock` 并被打上重试，起回来约 8 秒后自动变 `pending` 且库存正确扣减 |
-| 17 | payment / cart 并入 order-service，console 独立；补跨服务对账与 trace 打通 | 全链路一次下单能在日志里按同一个 trace id 串起来 |
+| 17（已完成） | 拆 order-service：`internal/order` + `internal/cart` + `internal/payment` 三块一起搬成 `cmd/order`（`:8085`），单体加 `ORDER_MODULE` 开关；网关只配一个环境变量就接管三组路由。console / shop 独立留到阶段 18 | 8080 的 `/orders`、`/cart`、`/payments` 全 **404**，8085 鉴权生效；SKU 3 库存 8 打 **20 并发** → **200 恰好 8 / 409 恰好 12**、库存 0、订单只多 8 行、便签全 `done`；支付 `pending`→`paid`；经网关下单 `user_id` 正确、`X-Trace-Id` 在网关 / 订单 / 商品三段日志同值 |
 
 阶段 13 之所以用「**旁路式**」：新增 8081 端口，`cmd/server/main.go` 一个字都不动。
 好处是零回归风险（原来的 8080 照常压测）、出问题直接不启动网关即可回退，
@@ -427,11 +427,44 @@ MySQL 复核：`stocks.quantity = 0`；这 20 个 `request_id` 在 `orders` 里*
 一句话总结：**剪断事务并没有换来「不确定」，它换来的是「有中间态、但一定会收敛」。**
 代价是多了一次约 1 毫秒的内网调用，以及一套必须自己写的重试补偿代码。
 
-### 11.7 还欠着的地方（主动说，别等被问）
+### 11.7 阶段 17 实测：订单服务独立与网关接管
+
+这一章把「订单 + 购物车 + 支付」搬成 `cmd/order`（`:8085`），单体 `ORDER_MODULE=0` 让位。
+和前面几章最大的不同是：**网关代码一行没改**。因为第 13 章的路由表早就写了
+`/cart`、`/orders`、`/payments` → `order`，这一章只是给它配了上游地址：
+
+```powershell
+$env:GATEWAY_UPSTREAM_ORDER="http://127.0.0.1:8085"
+```
+
+实测（2026-10-15 直连 + 2026-10-20 经网关）：
+
+- **搬家确认**：8080 的 `/orders`、`/cart/items`、`/payments/1` 全 **404**；8085 不带
+  `X-User-Id` → **401**，带上之后购物车读写 200、下单 200、支付 `pending` → `paid`。
+- **并发不超卖**：SKU 3 库存 **8**，20 个并发请求各买 1 件 → **200 恰好 8 / 409 恰好 12**。
+  MySQL 复核：`stocks.quantity=0`，`orders` 只多 8 行（7 `pending` + 1 `paid`），
+  `order_outbox` 8 条全 `done`，库存不足的订单 + 明细 + 便签一行不留。
+- **经网关鉴权**：不带 token 下单 **401**；登录后 `POST :8081/orders` 返回的 `user_id`
+  等于 token 的主人——说明「网关校验 token → 写 `X-User-Id` → 订单服务信任它」这条链路成立。
+- **trace**：拿一个必然 409 的请求带 `X-Trace-Id: stage17-gw-trace2`，网关、订单服务、
+  商品服务三份日志出现**同一个 id**，跨进程链路第一次完整串起来。
+- **顺手修掉的隐患**：`order_outbox.next_retry_at` 原本初始化成「现在」，后台 `RetryLoop`
+  可能在同步扣减还没返回时就抢到同一张便签。两条路径同时判定同一张订单，极端交错下会出现
+  「客户端 409、库里却有一张待付款订单」。修法是把首次可重试时间推后
+  `2 × RetryInterval`（4s > 3s 扣减超时），后台只接手「同步路径已放弃 / 进程崩了」的便签。
+- **支付回调幂等**：支付顺序是「先把订单改成 `paid`，再写支付流水」，中途崩掉会留下
+  「订单已付、流水仍 `pending`」。现在 `Pay` 对已付款订单直接返回成功，回调重试一次
+  就能把流水补完；实测同一张订单连续回调两次，两次都是 **200**，`payments` 只有一条流水。
+
+**没做的部分要主动讲**：`/shop`、`/demo` 还留在单体里，`/demo` 甚至是直接调用各模块的
+Service 对象（进程内函数调用），不是 HTTP。它们要独立，得先把这些调用改成接口——这是阶段 18。
+
+### 11.8 还欠着的地方（主动说，别等被问）
 
 - 限购 key `seckill:item:<id>:user:<uid>` **没有 TTL**，压测把 Redis 顶到过 713 万个 key；
 - MySQL 里还有约 **442 万条**历史 pending 订单，会拖慢 `ExpireLoop`（每轮只处理 200 笔）；
 - `internal/shop/handler.go` 仍在单体进程内**直接函数调用**秒杀服务（演示页面刻意保留，不值得为它绕一圈 HTTP）；
 - `order_outbox` 里 `done` 的记录不会自动清理；库存服务的内部接口 `/internal/stocks/deduct`
   只靠「网关不认识 `/internal` 前缀」挡着（外网 404），真上线还要加内网监听 / IP 白名单；
-- 阶段 17（payment / cart 并入 order、console 独立）还没做，见第 6 节。
+- 阶段 18：`/shop`、`/demo` 还在单体里；`/demo` 直接调用各模块 Service（进程内），
+  改成独立 console-service 需要先把这些调用换成 HTTP；跨服务对账也还没做。

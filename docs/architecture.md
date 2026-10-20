@@ -446,6 +446,9 @@ flowchart LR
   （`request_id` 唯一）记住每笔扣减的结论，第二次来直接回上次的答案，绝不多扣。
 - **退避与上限**：1s → 2s → 4s …（封顶 60s），最多 8 次（`OutboxMaxAttempts`）；
   用光或错误「修不好」就 `giveUp`：关单 + 便签判死 + 原因留在 `last_error` 里。
+- **这个循环跑在谁身上**：阶段 17 起跟着订单模块走——默认单体启动时跑在 `cmd/server`，
+  设了 `ORDER_MODULE=0` 就只跑在 `cmd/order`。两个进程同时跑也不会重复扣（`ClaimOutboxRetry`
+  的行锁 + 30 秒租约），但没必要让两个进程做同一件事，所以开关把路由和后台任务一起关。
   「放弃」不是「不管了」，而是把状态收拾干净，不让用户永远看到「确认中」。
 - **领取租约**：`ClaimOutboxRetry` 用行锁把一条便签「领走」并盖一个 30 秒的章，
   多实例部署时同一条便签不会被两个进程同时处理。
@@ -545,15 +548,15 @@ HTTP 长连接、单机多实例 + 负载均衡。
 | --- | --- | --- |
 | 用户服务（✅ 阶段 14 已落地） | `internal/user` | JWT 校验要么下沉到网关，要么各服务共享公钥 |
 | 商品 / 库存服务（✅ 阶段 16 已落地） | `internal/product`、`internal/inventory` | 库存归属唯一，避免两边同时改；扣减改成跨进程内部接口 + 幂等账本（`stock_deducts`），订单侧用 outbox 补偿 |
-| 订单服务 | `internal/order`、`internal/seckill`（秒杀已在阶段 15 单独落地为 seckill-service） | 跨服务事务改用「本地消息表 + 最终一致」——✅ 阶段 16 已落地为 `order_outbox` + `RetryLoop`；`pending_stock` 就是这套机制的中间态 |
-| 支付服务 | `internal/payment` | 回调幂等、对账 |
+| 订单服务（✅ 阶段 17 已落地） | `internal/order` + `internal/cart` + `internal/payment`（秒杀已在阶段 15 单独落地为 seckill-service） | 跨服务事务改用「本地消息表 + 最终一致」——✅ 阶段 16 已落地为 `order_outbox` + `RetryLoop`；`pending_stock` 就是这套机制的中间态。三块一起搬：`payments` 依赖订单，购物车与订单共享用户边界和购买流程；同库同进程让支付能直接调订单，避免一次付款跨两次网络 |
 
 拆分后的代价要提前想清楚：**分布式事务、链路追踪、服务发现、配置中心**都得补上，
 所以现阶段保持单体是划算的——**先让单体跑满，再按真实瓶颈拆**，而不是一开始就拆。
 
 阶段 14 抽出 `cmd/user`（`:8082`）、阶段 15 抽出 `cmd/seckill`（`:8083`）、
-阶段 16 抽出 `cmd/product`（`:8084`，含 `internal/inventory`）。
-单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` 三个开关——设成 `0` 就让位
+阶段 16 抽出 `cmd/product`（`:8084`，含 `internal/inventory`）、
+阶段 17 抽出 `cmd/order`（`:8085`，含 `internal/cart` / `internal/payment`）。
+单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` / `ORDER_MODULE` 四个开关——设成 `0` 就让位
 （不再注册那部分路由，秒杀那个还会连 Kafka 消费者和后台任务一起停），
 不设变量就是原来那个单体，**随时可以回退**。
 同机复测 1 万 QPS 无掉速（数字见 `docs/build.md` 阶段 15 与 `docs/microservices.md` 第 6 节）。

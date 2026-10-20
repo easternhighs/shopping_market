@@ -1302,6 +1302,129 @@ shopping_market/
   - 补偿任务目前按「单实例」设计。`ClaimOutboxRetry` 的行锁 + 30 秒租约已经能保证
     同一条便签不会被两个实例同时处理；但多实例下的批量扫描节奏还会重叠，量大了要再看。
 
+### 阶段 17：拆 order-service（订单 + 购物车 + 支付）并给单体加 ORDER_MODULE 开关（已完成）
+
+- 为什么做这一章：阶段 14~16 把 user、seckill、product 三个服务搬出去之后，
+  `docs/microservices.md` 第 6 节路线表里还剩最后一格——订单。这一章把
+  **订单（`internal/order`）+ 购物车（`internal/cart`）+ 支付（`internal/payment`）**
+  一起搬成 `cmd/order`（默认 `:8085`），单体加一个 `ORDER_MODULE=0` 开关一键让位。
+- 为什么三块一起搬，而不是拆成三个服务（面试可以直接讲）：
+  - `payments` 表存的是「哪张订单付过款」，离开订单表就没有意义；购物车记录的是
+    「这个用户准备买什么」，和订单共享同一个用户边界、同一段购买流程。
+  - 三块同库同进程，支付可以直接调用订单服务（进程内函数调用），**一次付款不产生
+    跨服务网络往返**。硬拆成三个服务，就要跨两次网络，每一跳都可能超时、重试、乱序，
+    换来的不是解耦，而是更多要自己兜底的失败场景。
+  - 一句话：**微服务的边界按「数据归属 + 一致性要求」划，不是越细越好。**
+- 这一章刻意不做的事：
+  - **不动 `/shop` 和 `/demo`**。`internal/shop` 只依赖 product + seckill，
+    `internal/demo` 直接拿四个模块的 Service 对象（进程内函数调用，不是 HTTP）。
+    它们要真正独立，得先改成调接口，工作量比搬三块代码大得多，留给阶段 18。
+  - **不引入新的 MQ 或分布式事务**。三块同库同进程，支付对订单是进程内调用；
+    当前「改订单状态 + 写支付流水」仍是先后两次更新，靠 `Pay` 幂等 + 回调重试收敛，
+    真要收成一个数据库事务还得再包一层，本阶段不做。
+  - **不删单体里的三块代码**。不设 `ORDER_MODULE` 就是老样子，退路永远留着。
+
+- 具体动了什么（三处）：
+
+  | 文件 | 改动 | 说明 |
+  | --- | --- | --- |
+  | `cmd/order/main.go`（新增） | 新进程入口 | 装配 order / cart / payment 三个模块；`AutoMigrate` 六张表；`/healthz` + `/health`；全部路由挂鉴权；启动库存补偿 `RetryLoop` |
+  | `cmd/server/main.go` | 加 `ORDER_MODULE` 开关 | 设 `0` 时**不注册** `/orders`、`/cart`、`/payments` 三组路由，也**不启动** `RetryLoop`；不设就是原来的单体 |
+  | `Makefile` | 加 `run-order` / `build-order` | 和 `run-product` 同一套写法 |
+
+- 服务边界（这一章结束后）：
+
+  | 进程 | 端口 | 管什么 | 独占的数据表 |
+  | --- | --- | --- | --- |
+  | `cmd/server`（单体兜底） | `:8080` | `/shop`、`/demo`、以及还没搬走的接口 | 不独占（`/demo` 会跨模块读写） |
+  | `cmd/gateway` | `:8081` | 统一入口、鉴权、注入 `X-User-Id` | 无 |
+  | `cmd/user` | `:8082` | `/login`、`/register`、`/me` | `users` |
+  | `cmd/seckill` | `:8083` | `/seckill/**`、`/metrics` | `seckill_activities`、`seckill_items`、`seckill_orders` |
+  | `cmd/product` | `:8084` | `/products`、`/stocks`、`/internal/stocks/deduct` | `products`、`skus`、`stocks`、`stock_deducts` |
+  | `cmd/order` | `:8085` | `/orders/**`、`/cart/**`、`/payments/**` | `orders`、`order_items`、`order_outbox`、`carts`、`cart_items`、`payments` |
+
+- 环境变量（只列这一章新增 / 相关的）：
+
+  | 变量 | 给谁用 | 默认 | 作用 |
+  | --- | --- | --- | --- |
+  | `ORDER_ADDR` | `cmd/order` | `:8085` | 订单服务监听地址 |
+  | `TRUST_USER_ID_HEADER` | `cmd/order` | 不设（= 关） | 设 `1`/`true` 才信任网关写的 `X-User-Id`。忘了设，所有请求都会 401 |
+  | `PRODUCT_SERVICE_URL` | `cmd/order` | `http://127.0.0.1:8084` | 扣库存打到哪 |
+  | `PRODUCT_SERVICE_TIMEOUT` | `cmd/order` | `3s` | 单次扣减超时 |
+  | `ORDER_MODULE` | `cmd/server` | 不设（= 开） | 设 `0` 时单体让出订单 / 购物车 / 支付三组路由与补偿任务 |
+  | `GATEWAY_UPSTREAM_ORDER` | `cmd/gateway` | 不设（→ 默认上游 `:8080`） | 设成 `http://127.0.0.1:8085`，网关就把这三组路径转给订单服务 |
+
+- 启动方式（四个终端）：
+
+  ```powershell
+  # 终端 1：商品服务（订单服务要调它扣库存）
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  go run ./cmd/product
+
+  # 终端 2：订单服务（注意必须打开 TRUST_USER_ID_HEADER）
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  $env:TRUST_USER_ID_HEADER="1"
+  go run ./cmd/order
+
+  # 终端 3：单体（让出订单三组路由）
+  $env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+  $env:ORDER_MODULE="0"
+  go run ./cmd/server
+
+  # 终端 4：网关（把 /orders、/cart、/payments 转到 8085）
+  $env:GATEWAY_UPSTREAM_ORDER="http://127.0.0.1:8085"
+  go run ./cmd/gateway
+  ```
+
+- 验收点：
+  1. 8080 上 `/orders`、`/cart/items`、`/payments/1` → **404**；8085 上同样路径 → **200 / 401**（确认真的搬走了）；
+  2. 订单服务**不带** `X-User-Id` → **401**（鉴权没有被搬丢）；
+  3. 经网关 `:8081` 用登录 token 下单成功，响应里的 `user_id` 等于 token 的主人（证明网关 → 订单服务 → `X-User-Id` 这条链路是通的）；
+  4. **并发下单不超卖**：库存 N 的 SKU 同时来 M 笔单，成功笔数**恰好**等于 N；
+  5. 支付走订单服务：`pending` → `paid`，状态与 `payments` 表一致；
+  6. `X-Trace-Id` 在网关、订单服务、商品服务三段日志里是**同一个值**；
+  7. 不设 `ORDER_MODULE` 时单体照旧能跑（回退路径有效）。
+
+- 实测记录（2026-10-15 直连验证 + 2026-10-20 网关验证）：
+  - 三件套：`gofmt -l cmd internal` 无输出、`go vet ./...`、`go build ./...` 干净。
+  - 拆分生效：8080 的 `/orders`、`/cart/items`、`/payments/1` 全是 **404**；
+    8085 不带用户头 → **401 `无效的登录令牌`**；带 `X-User-Id: 15` 加购物车、查购物车都是 **200**。
+  - **并发不超卖（核心指标）**：SKU 3 库存 **8**，20 个并发请求各买 1 件 →
+    **200 恰好 8 个 / 409 恰好 12 个 / 其它 0 个**。MySQL 复核：`stocks.quantity = 0`；
+    这 20 个 `request_id` 在 `orders` 里**只有 8 行**（7 `pending` + 1 `paid`）；
+    `order_outbox` 8 条全部 `done`；库存不足的 11 笔订单 + 明细 + 便签**一行都没留**
+    （`DeleteOrderCascade` 真的撤干净了）。
+  - 支付：对其中一张订单 `POST /orders/57/pay` → **200 `支付成功`**，
+    再查订单状态 `pending` → **`paid`**。
+  - **重复支付回调（本轮补验）**：同一张订单连续回调两次 → **两次都是 200**，
+    `payments` 仍然只有一条 `paid` 流水；再模拟「订单已改成 `paid`、流水还停在
+    `pending`」的崩溃窗口，回调一次就能把流水补成 `paid`（靠 `Pay` 对已付款订单返回成功）。
+  - **经网关**：`GET :8081/healthz` → 200；不带 token 的 `POST :8081/orders` → **401**；
+    登录后 `GET :8081/cart/items` → 200（2 件）；`POST :8081/orders` → 200（订单 id 78，`user_id=15`）；
+    网关日志显示 `order → http://127.0.0.1:8085`，说明一个环境变量就把流量挪走了。
+  - **trace 跨三进程**：拿一个必然 409 的请求（SKU 3 已售罄）带 `X-Trace-Id: stage17-gw-trace2`，
+    网关、订单服务、商品服务三份日志都出现**同一个** id。
+  - **回归**：`/health`、`/shop`、`/shop/seckill`、`/shop/cart`、`/shop/data`、`/demo`、`/demo/data`
+    全 **200**；秒杀端到端照常（`demo2` 抢 item 52 → `queued`，3 秒后 `seckill_orders` 出现
+    `pending`，`sold` 0 → 1）。
+  - **并发下观察到的一个坑（已修）**：20 并发那一轮，日志里出现过一句
+    「补偿判定库存不足，已关单 order=62」，但库里根本没有 62。原因是便签的
+    `next_retry_at` 初始化成了「现在」，后台 `RetryLoop` 在同步扣减还没返回时就抢到了同一张便签；
+    两条路径都判「库存不足」，最终状态没错，但日志会骗人。更坏的交错是
+    「同步路径撤单、后台路径却把订单改成 pending」——客户端收到 409，库里却留了一张待付款订单。
+    修复很小：把首次可重试时间推后 `2 × RetryInterval`（默认 4s，大于 3s 的扣减超时），
+    后台就只接手「同步路径已经放弃 / 进程崩了」的便签（见 `internal/order/service.go` 的注释）。
+
+- 遗留 / 不足（记下来，暂不改）：
+  - `/shop`、`/demo` 还在单体里，而且 `/demo` 是**直接调用各模块的 Service 对象**（进程内函数调用），
+    不是走 HTTP。它们要独立成 shop-service / console-service，得先把这些调用改成接口，
+    这是阶段 18 的主要工作。
+  - 单体与订单服务启动时都会 `AutoMigrate` 同样的六张表。GORM 的迁移是幂等的，不会改坏数据，
+    但「两个进程都能改表结构」本身不是好习惯；真上线应该把迁移交给单独的 job。
+  - `TRUST_USER_ID_HEADER` 是「信任网关」的开关，只能在内网监听；如果 8085 暴露到公网，
+    任何人手写一个 `X-User-Id` 就能冒充登录。
+  - 订单服务的内部扣库存接口同样没有额外鉴权，靠「网关不认识 `/internal` 前缀」挡着。
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

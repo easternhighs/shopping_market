@@ -155,28 +155,54 @@ func main() {
 	protected := r.Group("/")
 	protected.Use(authMiddleware)
 
-	// 购物车模块路由。
-	cartRepo := cart.NewRepository(dbConn)
-	cartService := cart.NewService(cartRepo)
-	cartHandler := cart.NewHandler(cartService)
-	cart.RegisterRoutes(protected, cartHandler)
+	// 后台任务共用一个「可取消的 context」：收到 Ctrl+C 时先取消它，
+	// 等后台任务退干净了再关 HTTP。它声明在这个位置（而不是文件后半段），
+	// 是因为下面订单模块里的库存补偿任务要用到它。
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
 
-	// 订单模块路由。
+	// 购物车 + 订单 + 支付三个模块（阶段 17 起归 cmd/order 管）。
 	//
-	// 阶段 16 起，订单服务不再直接拿 inventory.Repository：库存在另一个进程里，
-	// 「同一个事务里扣库存 + 建订单」那条路已经走不通了。
-	// 改成注入一个【跨服务的扣库存客户端】，具体打哪个地址见 orderDefaultDeductURL()，
-	// 也可以用环境变量 PRODUCT_SERVICE_URL 直接覆盖。
-	orderRepo := order.NewRepository(dbConn)
-	orderService := order.NewService(orderRepo, order.DeductClientFromEnv(orderDefaultDeductURL(cfg.HTTP.Addr)))
-	orderHandler := order.NewHandler(orderService)
-	order.RegisterRoutes(protected, orderHandler)
+	// 为什么这三块共用一个开关：它们的路由虽然分属三个包，但数据是连在一起的
+	// （payments 那张表存的是「哪张订单付过款」，购物车记录的是同一个用户准备买什么）。
+	// 放在一个进程里，付款可以直接调用订单模块（进程内函数调用），不用跨网络；
+	// 硬拆成三个进程，一次付款就要跨两次网络，超时、重试、乱序都得自己兜底。
+	// 所以「订单服务」= 这三个包装在一起，开关也只有一个。
+	//
+	// ORDER_MODULE=0 时【不】注册这三组路由（阶段 17 演示「真的拆出去了」用）：
+	//   - /orders、/cart、/payments 改由 cmd/order 那个独立进程提供，必须过网关才能访问；
+	//   - 库存补偿任务也跟着不启动 —— 两个进程同时扫同一张 outbox 表有行锁租约兜底、
+	//     不会重复扣，但没必要让两个进程做同一件事。
+	// 默认（不设这个变量）仍然注册，保证「单体服务仍可单独启动」这条验收标准。
+	if os.Getenv("ORDER_MODULE") != "0" {
+		// 购物车模块路由。
+		cartRepo := cart.NewRepository(dbConn)
+		cartService := cart.NewService(cartRepo)
+		cartHandler := cart.NewHandler(cartService)
+		cart.RegisterRoutes(protected, cartHandler)
 
-	// 支付模块路由。
-	paymentRepo := payment.NewRepository(dbConn)
-	paymentService := payment.NewService(paymentRepo, orderService)
-	paymentHandler := payment.NewHandler(paymentService)
-	payment.RegisterRoutes(protected, paymentHandler)
+		// 订单模块路由。
+		//
+		// 阶段 16 起，订单服务不再直接拿 inventory.Repository：库存在另一个进程里，
+		// 「同一个事务里扣库存 + 建订单」那条路已经走不通了。
+		// 改成注入一个【跨服务的扣库存客户端】，具体打哪个地址见 orderDefaultDeductURL()，
+		// 也可以用环境变量 PRODUCT_SERVICE_URL 直接覆盖。
+		orderRepo := order.NewRepository(dbConn)
+		orderService := order.NewService(orderRepo, order.DeductClientFromEnv(orderDefaultDeductURL(cfg.HTTP.Addr)))
+		orderHandler := order.NewHandler(orderService)
+		order.RegisterRoutes(protected, orderHandler)
+
+		// 支付模块路由。
+		paymentRepo := payment.NewRepository(dbConn)
+		paymentService := payment.NewService(paymentRepo, orderService)
+		paymentHandler := payment.NewHandler(paymentService)
+		payment.RegisterRoutes(protected, paymentHandler)
+
+		// 启动库存补偿任务（阶段 16）：每 2 秒扫一遍 order_outbox 里「还没扣成功」的便签，
+		// 按退避时间重新去商品服务扣库存。没有它，一次网络抖动就会让订单永远卡在
+		// pending_stock —— 那是最不该发生的事：用户以为下单成功了，库存却一直没扣。
+		go orderService.RetryLoop(runCtx, order.RetryInterval)
+	}
 
 	// 秒杀模块路由。
 	seckillRepo := seckill.NewRepository(dbConn)
@@ -290,14 +316,9 @@ func main() {
 
 	// 启动 6.3 的两个后台任务：采样循环和 LAG 探针。
 	// 它们都退出得很干脆（ctx 一取消就返回），进程退出时不会拖着不放。
-	runCtx, stopRun := context.WithCancel(context.Background())
-	defer stopRun()
+	// runCtx 是前面跟订单模块一起声明好的，所有后台任务共用同一个。
 	lagProbe.Start(runCtx)
 	go sampler.Run(runCtx)
-	// 启动库存补偿任务（阶段 16）：每 2 秒扫一遍 order_outbox 里「还没扣成功」的便签，
-	// 按退避时间重新去商品服务扣库存。没有它，一次网络抖动就会让订单永远卡在
-	// pending_stock —— 那是最不该发生的事：用户以为下单成功了，库存却一直没扣。
-	go orderService.RetryLoop(runCtx, order.RetryInterval)
 
 	addr := cfg.HTTP.Addr
 	if addr == "" {

@@ -1,4 +1,4 @@
-.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill run-product build-product env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill run-product build-product run-order build-order env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -55,6 +55,22 @@ run-product:
 
 build-product:
 	go build -o bin/product ./cmd/product
+
+# 阶段 17：订单服务。把 internal/order + internal/cart + internal/payment 三块
+# 搬成独立进程（默认 :8085）。要让它真正接管流量，需要三件事配合：
+#   1) 网关那边设 GATEWAY_UPSTREAM_ORDER=http://127.0.0.1:8085，
+#      网关才会把 /orders、/cart、/payments 转过来（网关代码一行都不用改）；
+#   2) 单体那边设 ORDER_MODULE=0，让它别再提供这三组路由、
+#      也别再跑那个库存补偿任务（两个进程同时扫同一张 outbox 表不会重复扣，
+#      但没必要让两个进程做同一件事）；
+#   3) 本服务设 TRUST_USER_ID_HEADER=1，它才会直接采用网关注入的 X-User-Id。
+# 另外这个服务要能扣库存，前提是商品服务（:8084）活着 —— 打哪个地址由
+# PRODUCT_SERVICE_URL 决定，不设就默认 http://127.0.0.1:8084。
+run-order:
+	go run ./cmd/order
+
+build-order:
+	go build -o bin/order ./cmd/order
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d
