@@ -1,4 +1,4 @@
-.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill run-product build-product run-order build-order env-up env-down logs kafka-partitions kafka-lag bench-report
+.PHONY: run build run-gateway build-gateway run-user build-user run-seckill build-seckill run-product build-product run-order build-order run-shop build-shop run-console build-console env-up env-down logs kafka-partitions kafka-lag bench-report
 
 run:
 	go run ./cmd/server
@@ -71,6 +71,25 @@ run-order:
 
 build-order:
 	go build -o bin/order ./cmd/order
+
+# 阶段 18：独立前台。只发页面、拼页面数据，不连 MySQL / Redis / Kafka。
+# 要让它接管流量：单体设 SHOP_MODULE=0，网关设
+# GATEWAY_UPSTREAM_SHOP=http://127.0.0.1:8086。
+# 它调商品 / 秒杀服务，地址分别由 PRODUCT_SERVICE_URL、SECKILL_SERVICE_URL 决定。
+run-shop:
+	go run ./cmd/shop
+
+build-shop:
+	go build -o bin/shop ./cmd/shop
+
+# 阶段 18：独立演示控制台。它的一键造数会跨服务调用用户 / 商品 / 秒杀。
+# 要让它接管流量：单体设 CONSOLE_MODULE=0，网关设
+# GATEWAY_UPSTREAM_CONSOLE=http://127.0.0.1:8087。
+run-console:
+	go run ./cmd/console
+
+build-console:
+	go build -o bin/console ./cmd/console
 
 env-up:
 	docker compose -f deployments/docker-compose.yml up -d

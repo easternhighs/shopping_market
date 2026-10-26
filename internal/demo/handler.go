@@ -18,11 +18,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-
-	"shopping_market/internal/inventory"
-	"shopping_market/internal/product"
-	"shopping_market/internal/seckill"
-	"shopping_market/internal/user"
 )
 
 // demoActivityLimit 是演示页最多显示几场秒杀活动（按活动 ID 从大到小取最近的几场）。
@@ -37,13 +32,13 @@ var indexPage []byte
 
 // Handler 是演示控制台的 HTTP 层。
 //
-// 它自己不碰任何数据库表，只是把各个模块已经对外提供的能力拼起来用，
-// 所以这里注入的全是各模块的 Service，而不是 *gorm.DB。
+// 它自己不碰任何数据库表，只是把各个模块已经对外提供的能力拼起来用。
+// 阶段 18 起注入的是接口：单体模式由本地适配器实现，独立进程由 HTTP 客户端实现。
 type Handler struct {
-	users    *user.Service
-	products *product.Service
-	stocks   *inventory.Service
-	seckill  *seckill.Service
+	users    UserRegistrar
+	products ProductStore
+	stocks   StockStore
+	seckill  SeckillAdmin
 
 	// seedEnabled 控制「一键造数据」接口开不开，用环境变量 DEMO_SEED=0 关掉。
 	// 这个接口会往库里写数据，属于演示专用；真上线时把它关掉即可。
@@ -51,7 +46,7 @@ type Handler struct {
 }
 
 // NewHandler 创建演示控制台 HTTP 层。
-func NewHandler(users *user.Service, products *product.Service, stocks *inventory.Service, seckillService *seckill.Service) *Handler {
+func NewHandler(users UserRegistrar, products ProductStore, stocks StockStore, seckillService SeckillAdmin) *Handler {
 	return &Handler{
 		users:       users,
 		products:    products,
@@ -112,7 +107,7 @@ type demoItem struct {
 func (h *Handler) Data(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	activities, err := h.seckill.ListActivities()
+	activities, err := h.seckill.ListActivities(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -126,7 +121,7 @@ func (h *Handler) Data(c *gin.Context) {
 
 	items := make([]demoItem, 0, len(activities))
 	for _, activity := range activities {
-		activityItems, err := h.seckill.ListItems(activity.ID)
+		activityItems, err := h.seckill.ListItems(ctx, activity.ID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -163,9 +158,15 @@ func (h *Handler) Data(c *gin.Context) {
 	// 商品也按 ID 从大到小排，页面默认选中最新造出来的那个。
 	sort.Slice(items, func(i, j int) bool { return items[i].ID > items[j].ID })
 
+	pending, err := h.seckill.Pending(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"items":       items,
-		"pending":     h.seckill.Pending(),
+		"pending":     pending,
 		"server_time": time.Now(),
 		"hint":        "remaining_stock 读的是 Redis 预扣库存，sold 读的是 MySQL 账本，两者相差的就是还在 Kafka 里排队的订单",
 	})

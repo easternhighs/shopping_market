@@ -255,6 +255,9 @@ func main() {
 		seckillGroup := protected.Group("/")
 		seckillGroup.Use(ratelimit.RateLimit(ratelimit.NewAdaptiveLimiter(seckillRateLimiter, adaptiveController), 100, time.Second, appMetrics.ObserveRateLimited))
 		seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
+		// 阶段 18：独立模式的 shop / console 通过这些 /internal 接口取秒杀数据。
+		// 它们和秒杀模块同生共死：SECKILL_MODULE=0 时单体让位，由 :8083 提供。
+		seckill.RegisterInternalRoutes(r, seckillHandler)
 	}
 
 	// LAG 探针：每 5 秒问一次 Kafka「消费组落后多少条消息」，把答案留在内存里。
@@ -282,10 +285,19 @@ func main() {
 	// 四个模块串起来，挂在 /demo 下。它是纯新增的旁路功能，不参与抢购热路径；
 	// /demo 和 /metrics 的访问也不计入 metrics 的「业务总请求」，
 	// 免得演示页自己的轮询污染压测口径（见 internal/pkg/metrics/middleware.go）。
-	demoHandler := demo.NewHandler(userService, productService, inventoryService, seckillService)
-	// 「一键造数据」会往库里写数据，属于演示专用；启动时设置 DEMO_SEED=0 可以关掉它。
-	demoHandler.SetSeedEnabled(os.Getenv("DEMO_SEED") != "0")
-	demo.RegisterRoutes(r, demoHandler)
+	// 阶段 18：CONSOLE_MODULE=0 时单体不再提供 /demo，留给 :8087 的独立控制台。
+	// 不设这个变量时仍是阶段 17 的老行为；注入本地适配器，页面逻辑不用改。
+	if os.Getenv("CONSOLE_MODULE") != "0" {
+		demoHandler := demo.NewHandler(
+			demo.NewLocalUserRegistrar(userService),
+			demo.NewLocalProductStore(productService),
+			demo.NewLocalStockStore(inventoryService),
+			demo.NewLocalSeckillAdmin(seckillService),
+		)
+		// 「一键造数据」会往库里写数据，属于演示专用；启动时设置 DEMO_SEED=0 可以关掉它。
+		demoHandler.SetSeedEnabled(os.Getenv("DEMO_SEED") != "0")
+		demo.RegisterRoutes(r, demoHandler)
+	}
 
 	// 独立前台（阶段 7）：给用户看的商城页面，挂在 /shop 下。
 	// 和 /demo 的分工：/demo 讲「系统内部在干什么」，/shop 讲「用户看到了什么」。
@@ -295,8 +307,15 @@ func main() {
 	//
 	// 注意第三个参数：把上面那个统一的鉴权中间件传进去，只有 /shop/my（查我的订单）需要登录。
 	// 页面本身不挂鉴权——得先能打开页面，才谈得上在里面登录。
-	shopHandler := shop.NewHandler(productService, seckillService)
-	shop.RegisterRoutes(r, shopHandler, authMiddleware)
+	// 阶段 18：SHOP_MODULE=0 时单体不再提供 /shop，留给 :8086 的独立前台。
+	// 同样注入本地适配器，单体模式下还是进程内函数调用，没有额外网络往返。
+	if os.Getenv("SHOP_MODULE") != "0" {
+		shopHandler := shop.NewHandler(
+			shop.NewLocalProductReader(productService),
+			shop.NewLocalSeckillReader(seckillService),
+		)
+		shop.RegisterRoutes(r, shopHandler, authMiddleware)
+	}
 	// 启动秒杀消费端：它像一个后台工作人员，不停从 Kafka 拿消息，
 	// 再把“已经在 Redis 预扣成功”的请求真正写进 MySQL。
 	if os.Getenv("SECKILL_MODULE") != "0" {

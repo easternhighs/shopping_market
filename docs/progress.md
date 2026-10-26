@@ -4,8 +4,16 @@
 
 ## 当前状态
 
-- 当前阶段：**阶段 17 已完成**（拆 order-service：订单 + 购物车 + 支付）。微服务拆分路线（阶段 13 网关 → 14 用户服务 → 15 秒杀服务 → 16 商品/库存服务 → 17 订单服务）走到第 5 步：`cmd/gateway` / `cmd/user` / `cmd/seckill` / `cmd/product` / `cmd/order` 五个独立进程都能跑，单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` / `ORDER_MODULE` 四个开关可以一键让位（不设变量就是原来那个单体）。还留在单体里的是 `/shop` 和 `/demo` 两块旁路页面——`/demo` 目前直接调用各模块的 Service 对象（进程内函数调用），这是阶段 18 的主要工作
-- 本次完成：**拆出 `cmd/order`（订单 + 购物车 + 支付），单体加 `ORDER_MODULE` 开关**（阶段 17 完成）
+- 当前阶段：**阶段 18 已完成（2026-10-26）**。项目规划中的阶段 0～18 已全部收口；`cmd/shop`（`:8086`）与 `cmd/console`（`:8087`）已通过 HTTP 访问兄弟服务，单体仍保留本地适配器和 `SHOP_MODULE` / `CONSOLE_MODULE` 回退开关
+- 本次完成：**拆出 shop-service 与 console-service，填完两个 HTTP 客户端并走通独立模式验收**（阶段 18 完成）
+  - HTTP 客户端：两份 `do(...)` 都改成「序列化请求体 → 用 `bytes.NewReader` 作为真正的 HTTP Body → 带 trace → 读取并关闭响应体 → 非 2xx 保留状态与响应内容 → 解析响应 JSON」；删除了骨架 TODO 和占位错误
+  - 测试：新增 `internal/shop/http_client_test.go` 与 `internal/demo/http_client_test.go`，覆盖 POST 请求体、Content-Type、trace、正常响应解析、409 状态保留和响应体关闭
+  - **实测**：`SHOP_MODULE=0` / `CONSOLE_MODULE=0` 时 8080 的 `/shop`、`/demo` 都是 **404**；不设开关时两者都是 **200**。8086 的 `/shop`、`/shop/data` 与 8087 的 `/demo`、`/demo/data` 都是 **200**；经网关四个地址也都是 **200**
+  - **鉴权与造数**：`/shop/my` 直连和经网关不带 token 都是 **401**，登录 `demo1` 后经网关 **200**；独立控制台 `/demo/seed` 跨服务建成活动 `33`、4 个秒杀商品和 3 个演示账号，首个秒杀商品 `56` 的 Redis 剩余库存为 **30**
+  - **主链路**：经网关抢 item `56` 返回 `queued`，Kafka 落库后 `/shop/my` 能查到同一 `request_id`，Redis 剩余从 **30** 变成 **29**、MySQL `sold` 从 **0** 变成 **1**
+  - **trace**：`stage18-gw-console-trace` 同时出现在网关日志和下游用户服务日志；商品错误链路的 `stage18-error-chain` 也从网关贯穿到商品服务。单元测试另外断言了 HTTP 客户端会把 trace 继续传给下游
+  - **校验**：`gofmt -l cmd internal` 无输出、`go test -count=1 ./...`、`go vet ./...`、`go build ./...` 全部通过；四个新增/修改文件均为 LF、无 BOM
+- 上一轮完成：**拆出 `cmd/order`（订单 + 购物车 + 支付），单体加 `ORDER_MODULE` 开关**（阶段 17 完成）
   - 搬家：新增 `cmd/order`（默认 `:8085`），`internal/order` + `internal/cart` + `internal/payment` 三块一起搬过去；`AutoMigrate` 六张表（`orders` / `order_items` / `order_outbox` / `carts` / `cart_items` / `payments`）；全部路由挂鉴权；库存补偿 `RetryLoop` 跟着搬到这个进程；`Makefile` 补 `run-order` / `build-order`
   - 边界判断（面试重点）：`payments` 表依赖订单，购物车与订单共享用户边界和购买流程；三块同库同进程，支付能直接调订单，**一次付款不产生跨服务网络往返**。硬拆成三个服务就要跨两次网络，超时、重试、乱序都得自己兜底。结论：**微服务边界按「数据归属 + 一致性要求」划，不是越细越好**
   - 单体开关：`ORDER_MODULE=0` 时**不注册** `/orders`、`/cart`、`/payments` 三组路由，也**不启动** `RetryLoop`；不设变量时行为与阶段 16 完全一致（回退路径有效）
@@ -240,3 +248,4 @@
 - [x] 阶段 15：拆 seckill-service（`cmd/seckill` 独立进程 + 单体 `SECKILL_MODULE` 开关 + k6 地址可配置；4 处空已填、4 个缺陷已修、10 步验证走通，1 万 QPS 复测无掉速）
 - [x] 阶段 16：拆 product-service（`cmd/product` 含 inventory + `PRODUCT_MODULE` 开关 + 订单 outbox 补偿 / 退避重试 / 超限关单；用户授权直接实现、未挖空；6 项验收 + 20 并发不超卖实测走通）
 - [x] 阶段 17：拆 order-service（`cmd/order` 含 order + cart + payment，`:8085`；单体 `ORDER_MODULE` 开关；网关一个环境变量接管三组路由；20 并发不超卖、支付流转、三进程 trace 同 id 实测走通；顺手修掉补偿与同步扣减抢同一张便签的隐患）
+- [x] 阶段 18：拆 shop-service 与 console-service（`:8086` / `:8087`，纯组装、本地适配器与 HTTP 客户端双模式；`SHOP_MODULE` / `CONSOLE_MODULE` 单体开关；HTTP 客户端、单元测试与独立模式端到端验收均已完成）

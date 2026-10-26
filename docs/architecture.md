@@ -60,6 +60,8 @@ MySQL、Redis、Kafka 是三个「外部帮手」，分别负责**存账本**、
 ```
 cmd/
   server/        服务入口：装配所有模块、启动消费端和对账任务
+  shop/          独立前台进程（阶段 18，:8086）：只发页面、组装数据，不连基础设施
+  console/       独立演示控制台进程（阶段 18，:8087）：只发 /demo 页面并跨服务造数
   loadtest/      Go 压测工具
 internal/
   user/          注册 / 登录 / JWT 鉴权
@@ -547,8 +549,10 @@ HTTP 长连接、单机多实例 + 负载均衡。
 | 服务 | 拆出去的边界 | 拆分后需要额外处理的事 |
 | --- | --- | --- |
 | 用户服务（✅ 阶段 14 已落地） | `internal/user` | JWT 校验要么下沉到网关，要么各服务共享公钥 |
+| 秒杀服务（✅ 阶段 15 已落地） | `internal/seckill` | Redis/Kafka 连接、消费者与后台任务只归一个进程；跨进程不能依赖进程内计数器 |
 | 商品 / 库存服务（✅ 阶段 16 已落地） | `internal/product`、`internal/inventory` | 库存归属唯一，避免两边同时改；扣减改成跨进程内部接口 + 幂等账本（`stock_deducts`），订单侧用 outbox 补偿 |
 | 订单服务（✅ 阶段 17 已落地） | `internal/order` + `internal/cart` + `internal/payment`（秒杀已在阶段 15 单独落地为 seckill-service） | 跨服务事务改用「本地消息表 + 最终一致」——✅ 阶段 16 已落地为 `order_outbox` + `RetryLoop`；`pending_stock` 就是这套机制的中间态。三块一起搬：`payments` 依赖订单，购物车与订单共享用户边界和购买流程；同库同进程让支付能直接调订单，避免一次付款跨两次网络 |
+| 页面服务（✅ 阶段 18 已落地） | `internal/shop`、`internal/demo` | 只组装页面，不拥有数据；独立进程通过 HTTP 客户端取数 / 造数，并保留单体本地适配器作为回退 |
 
 拆分后的代价要提前想清楚：**分布式事务、链路追踪、服务发现、配置中心**都得补上，
 所以现阶段保持单体是划算的——**先让单体跑满，再按真实瓶颈拆**，而不是一开始就拆。
@@ -556,7 +560,10 @@ HTTP 长连接、单机多实例 + 负载均衡。
 阶段 14 抽出 `cmd/user`（`:8082`）、阶段 15 抽出 `cmd/seckill`（`:8083`）、
 阶段 16 抽出 `cmd/product`（`:8084`，含 `internal/inventory`）、
 阶段 17 抽出 `cmd/order`（`:8085`，含 `internal/cart` / `internal/payment`）。
-单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` / `ORDER_MODULE` 四个开关——设成 `0` 就让位
+阶段 18（✅ 已完成）新增 `cmd/shop`（`:8086`）与 `cmd/console`（`:8087`），两者都是「纯组装」进程：
+不连 MySQL / Redis / Kafka，只向兄弟服务取数或造数。它们的 `internal/shop`、`internal/demo`
+在本轮从「依赖具体 Service」改成「依赖接口」——单体注入本地适配器，独立进程注入 HTTP 客户端。
+单体保留 `USER_MODULE` / `SECKILL_MODULE` / `PRODUCT_MODULE` / `ORDER_MODULE` / `SHOP_MODULE` / `CONSOLE_MODULE` 六个开关——设成 `0` 就让位
 （不再注册那部分路由，秒杀那个还会连 Kafka 消费者和后台任务一起停），
 不设变量就是原来那个单体，**随时可以回退**。
 同机复测 1 万 QPS 无掉速（数字见 `docs/build.md` 阶段 15 与 `docs/microservices.md` 第 6 节）。

@@ -235,6 +235,7 @@ flowchart LR
 | 15（已完成） | 拆 seckill-service：搬 `internal/seckill`（含消费者、对账、Redis Lua、Kafka 生产端） | **复测 1 万 QPS**，确认拆进程后热路径没有掉速——实测 128 / 256 / 512 VU 约 **10.5k / 11.2k / 11.5k QPS**，A/B 对照单体 134,910 次 vs 秒杀服务 134,876 次（p50 20.7ms vs 20.6ms），**无掉速** |
 | 16（已完成） | 拆 product-service（含 inventory），并改造 order 里那条同库事务（第 5.3 节）：本地消息表 + 跨进程扣减 + 后台补偿 | 并发下单不超卖——SKU 库存 7 打 **20 并发**，**200 恰好 7 / 409 恰好 13**、库存扣到 0、`orders` 只有 7 行、账本 applied 7 / rejected 13、便签无残留 `pending`；人为停掉库存服务，订单进入 `pending_stock` 并被打上重试，起回来约 8 秒后自动变 `pending` 且库存正确扣减 |
 | 17（已完成） | 拆 order-service：`internal/order` + `internal/cart` + `internal/payment` 三块一起搬成 `cmd/order`（`:8085`），单体加 `ORDER_MODULE` 开关；网关只配一个环境变量就接管三组路由。console / shop 独立留到阶段 18 | 8080 的 `/orders`、`/cart`、`/payments` 全 **404**，8085 鉴权生效；SKU 3 库存 8 打 **20 并发** → **200 恰好 8 / 409 恰好 12**、库存 0、订单只多 8 行、便签全 `done`；支付 `pending`→`paid`；经网关下单 `user_id` 正确、`X-Trace-Id` 在网关 / 订单 / 商品三段日志同值 |
+| 18（已完成） | 拆 shop-service（`:8086`）与 console-service（`:8087`）：两块都只组装页面、不拥有数据表；单体加 `SHOP_MODULE` / `CONSOLE_MODULE` 开关，并保留本地适配器作为回退路径 | 两个进程能独立启动、页面和健康检查 200；`/shop/my` 无鉴权 401；单体开关生效；两个 HTTP 客户端的 `do(...)` 已填完，`/shop/data`、`/demo/data`、`/demo/seed` 能跨服务取数 / 造数，且 trace 贯穿到下游；经网关真实抢购后 Kafka 正常落库 |
 
 阶段 13 之所以用「**旁路式**」：新增 8081 端口，`cmd/server/main.go` 一个字都不动。
 好处是零回归风险（原来的 8080 照常压测）、出问题直接不启动网关即可回退，
@@ -456,15 +457,18 @@ $env:GATEWAY_UPSTREAM_ORDER="http://127.0.0.1:8085"
   「订单已付、流水仍 `pending`」。现在 `Pay` 对已付款订单直接返回成功，回调重试一次
   就能把流水补完；实测同一张订单连续回调两次，两次都是 **200**，`payments` 只有一条流水。
 
-**没做的部分要主动讲**：`/shop`、`/demo` 还留在单体里，`/demo` 甚至是直接调用各模块的
-Service 对象（进程内函数调用），不是 HTTP。它们要独立，得先把这些调用改成接口——这是阶段 18。
+**阶段 18 已完成（2026-10-26）**：`/shop`、`/demo` 的 Handler 不再直接依赖各模块 Service，
+而是依赖只读 / 管理接口；单体用本地适配器保持进程内调用，独立进程用 HTTP 客户端。
+`cmd/shop`（`:8086`）和 `cmd/console`（`:8087`）已经能独立取数 / 造数，两个 HTTP 客户端
+会正确发送请求体、关闭并解析响应、保留非 2xx 状态、透传 trace。实测 `/shop/data`、
+`/demo/data`、`/demo/seed` 和网关转发全部走通；经网关抢购后 Kafka 正常落库。
 
 ### 11.8 还欠着的地方（主动说，别等被问）
 
 - 限购 key `seckill:item:<id>:user:<uid>` **没有 TTL**，压测把 Redis 顶到过 713 万个 key；
 - MySQL 里还有约 **442 万条**历史 pending 订单，会拖慢 `ExpireLoop`（每轮只处理 200 笔）；
-- `internal/shop/handler.go` 仍在单体进程内**直接函数调用**秒杀服务（演示页面刻意保留，不值得为它绕一圈 HTTP）；
+- `internal/shop/handler.go` 的单体模式仍走本地适配器（进程内函数调用），这是刻意的回退路径；
 - `order_outbox` 里 `done` 的记录不会自动清理；库存服务的内部接口 `/internal/stocks/deduct`
   只靠「网关不认识 `/internal` 前缀」挡着（外网 404），真上线还要加内网监听 / IP 白名单；
-- 阶段 18：`/shop`、`/demo` 还在单体里；`/demo` 直接调用各模块 Service（进程内），
-  改成独立 console-service 需要先把这些调用换成 HTTP；跨服务对账也还没做。
+- `/shop` / `/demo` 页面里的请求仍是相对路径，直接打开 8086 / 8087 时业务交互会 404，
+  经网关访问才完整；这是「页面服务只负责发页面」的刻意边界。

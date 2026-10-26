@@ -193,6 +193,8 @@ func main() {
 		100, time.Second, appMetrics.ObserveRateLimited,
 	))
 	seckill.RegisterRoutes(seckillGroup, protected, seckillHandler)
+	// 独立模式下的 shop / console 通过这些接口读活动、库存和订单。
+	seckill.RegisterInternalRoutes(r, seckillHandler)
 
 	// runCtx 是三个后台任务的「总开关」：进程要退出时取消它，
 	// 它们就会各自收尾返回，而不是被硬生生掐断。

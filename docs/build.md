@@ -1425,6 +1425,224 @@ shopping_market/
     任何人手写一个 `X-User-Id` 就能冒充登录。
   - 订单服务的内部扣库存接口同样没有额外鉴权，靠「网关不认识 `/internal` 前缀」挡着。
 
+## 阶段 18：拆出 shop-service 与 console-service（已完成）
+
+### 18.1 这一阶段要解决什么
+
+阶段 17 结束时，业务后端已经拆成了 user / seckill / product / order 四个服务，
+但还有两块「组装型」代码留在单体里：
+
+- `internal/shop`：给普通用户看的商城列表、秒杀独立页、购物车页；
+- `internal/demo`：给面试官看的演示控制台，以及「一键造数据」。
+
+它们和业务模块的区别是：**自己一张表都不管**。
+`shop` 只是把商品、秒杀数据拼成页面要的 JSON；`demo` 只是替人把商品、库存、活动、账号建出来。
+这类代码最适合单独跑，因为它们可以随意重启、扩容，出了故障也不影响下单和抢购。
+
+这一阶段把它们拆成两个进程：
+
+| 进程 | 默认端口 | 负责什么 | 自己拥有数据表吗 |
+| --- | --- | --- | --- |
+| `cmd/shop` | `:8086` | `/shop`、`/shop/seckill`、`/shop/cart`、`/shop/data`、`/shop/my` | 否 |
+| `cmd/console` | `:8087` | `/demo`、`/demo/data`、`/demo/seed` | 否 |
+
+### 18.2 为什么叫「纯组装服务」
+
+直白地说：它们像餐厅前台，不负责种菜、不做菜，只把客人要的信息从后厨几个窗口取回来拼成一份菜单。
+
+- 单体模式：前台和厨师在同一个房间，喊一嗓子就能拿到数据（进程内函数调用）；
+- 独立模式：前台搬到了另一个房间，只能打电话问后厨（HTTP 请求）。
+
+代码里对应两种适配器：
+
+| 适配器 | 什么时候用 | 怎么拿数据 |
+| --- | --- | --- |
+| `local_adapters.go` | 单体启动 | 直接调用 `product.Service`、`seckill.Service` 等对象 |
+| `http_client.go` | 独立进程启动 | 调用兄弟服务的 `/internal/...` 接口 |
+
+页面组装代码（`Handler`）只认接口，不认背后的实现。
+这样「单体」和「微服务」共用同一份页面逻辑，不会出现两套页面各改各的。
+
+### 18.3 单体怎么保留回退能力
+
+和阶段 14～17 一样，单体必须还能单独跑。新增两个开关：
+
+| 变量 | 给谁用 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `SHOP_MODULE` | `cmd/server` | 不设（= 开） | 设 `0` 时单体不注册 `/shop` 路由 |
+| `CONSOLE_MODULE` | `cmd/server` | 不设（= 开） | 设 `0` 时单体不注册 `/demo` 路由 |
+
+不设这两个变量时，阶段 17 的行为完全不变；
+都设成 `0` 时，两块页面分别由 `:8086` 和 `:8087` 提供，单体只保留真正搬不走的接口。
+
+### 18.4 内部接口契约
+
+独立模式的 shop / console 不直接连 MySQL、Redis、Kafka，只能通过下面这些内部接口取数或造数。
+这些接口都注册在 `/internal` 前缀下，网关的路由表不认识这个前缀，所以从外网经网关访问会得到 404。
+
+#### 商品服务（`:8084`）
+
+| 方法 | 路径 | 用途 | 返回 |
+| --- | --- | --- | --- |
+| `GET` | `/internal/products/skus?product_ids=1,2,3` | 一次拿多个商品的规格 | `{"skus":[...]}` |
+| `POST` | `/internal/products/skus/find` | 按「商品 + 规格」查 SKU | `{"sku":{...}}` 或 `{"sku":null}` |
+
+控制台还需要「列商品、建商品、建 SKU」，直接复用已有的公开接口
+`GET /products`、`POST /products`、`POST /products/:id/skus`。
+
+#### 秒杀服务（`:8083`）
+
+| 方法 | 路径 | 用途 | 返回 |
+| --- | --- | --- | --- |
+| `GET` | `/internal/seckill/activities` | 列活动 | `{"activities":[...]}` |
+| `POST` | `/internal/seckill/activities` | 建活动 | `{"activity":{...}}` |
+| `GET` | `/internal/seckill/activities/:id/items` | 列某场活动的秒杀商品 | `{"items":[...]}` |
+| `POST` | `/internal/seckill/activities/:id/items` | 往活动里加秒杀商品 | `{"item":{...}}` |
+| `GET` | `/internal/seckill/items/:id/stock` | 读 Redis 剩余库存 | `{"remaining_stock":10,"stock_ready":true}` |
+| `POST` | `/internal/seckill/items/:id/warmup` | 预热 Redis | `{"status":"ok"}` |
+| `GET` | `/internal/seckill/pending` | 读 Kafka 在途订单数 | `{"pending":0}` |
+| `GET` | `/internal/seckill/users/:uid/orders` | 查某个用户的秒杀订单 | `{"orders":[...]}` |
+| `GET` | `/internal/seckill/config` | 读付款时限 | `{"pay_timeout_seconds":900}` |
+
+#### 用户服务（`:8082`）
+
+控制台造演示账号直接复用公开接口 `POST /register`。
+用户已存在时它返回 `409`，控制台把 `409` 翻译成 `user.ErrUsernameTaken`，当成「上次已经建好」跳过。
+
+### 18.5 新增环境变量
+
+| 变量 | 给谁用 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `SHOP_ADDR` | `cmd/shop` | `:8086` | 前台服务监听地址 |
+| `CONSOLE_ADDR` | `cmd/console` | `:8087` | 演示控制台监听地址 |
+| `TRUST_USER_ID_HEADER` | `cmd/shop` | 不设（= 关） | 设 `1`/`true` 才信任网关写的 `X-User-Id`；独立服务跑在网关后面时必须打开 |
+| `PRODUCT_SERVICE_URL` | shop / console | `http://127.0.0.1:8084` | 商品与库存服务地址 |
+| `SECKILL_SERVICE_URL` | shop / console | `http://127.0.0.1:8083` | 秒杀服务地址 |
+| `USER_SERVICE_URL` | console | `http://127.0.0.1:8082` | 用户服务地址 |
+| `DEMO_SEED` | console（以及单体） | 不设（= 开） | 设 `0` 关闭「一键造数据」 |
+| `GATEWAY_UPSTREAM_SHOP` | `cmd/gateway` | 不设（→ 默认上游 `:8080`） | 设成 `http://127.0.0.1:8086`，把 `/shop` 转给独立前台 |
+| `GATEWAY_UPSTREAM_CONSOLE` | `cmd/gateway` | 不设（→ 默认上游 `:8080`） | 设成 `http://127.0.0.1:8087`，把 `/demo` 转给独立控制台 |
+
+### 18.6 启动顺序
+
+独立模式至少需要下面这些进程。前四个是业务服务，第五、第六个是只做组装的页面服务：
+
+```powershell
+# 1. 商品 + 库存
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+go run ./cmd/product
+
+# 2. 用户
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+$env:TRUST_USER_ID_HEADER="1"
+go run ./cmd/user
+
+# 3. 秒杀
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+$env:SECKILL_TRUST_USER_ID_HEADER="1"
+go run ./cmd/seckill
+
+# 4. 订单 + 购物车 + 支付
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+$env:TRUST_USER_ID_HEADER="1"
+go run ./cmd/order
+
+# 5. 独立前台
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+$env:TRUST_USER_ID_HEADER="1"
+go run ./cmd/shop
+
+# 6. 独立控制台
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+go run ./cmd/console
+
+# 7. 单体（让出已经搬走的路由）
+$env:GOCACHE="E:\桌面\Go_Project\shopping_market\.gocache"
+$env:USER_MODULE="0"
+$env:SECKILL_MODULE="0"
+$env:PRODUCT_MODULE="0"
+$env:ORDER_MODULE="0"
+$env:SHOP_MODULE="0"
+$env:CONSOLE_MODULE="0"
+go run ./cmd/server
+
+# 8. 网关
+$env:GATEWAY_UPSTREAM_USER="http://127.0.0.1:8082"
+$env:GATEWAY_UPSTREAM_SECKILL="http://127.0.0.1:8083"
+$env:GATEWAY_UPSTREAM_PRODUCT="http://127.0.0.1:8084"
+$env:GATEWAY_UPSTREAM_ORDER="http://127.0.0.1:8085"
+$env:GATEWAY_UPSTREAM_SHOP="http://127.0.0.1:8086"
+$env:GATEWAY_UPSTREAM_CONSOLE="http://127.0.0.1:8087"
+go run ./cmd/gateway
+```
+
+### 18.7 验收标准
+
+1. 不设 `SHOP_MODULE` / `CONSOLE_MODULE` 时，单体 `:8080` 的 `/shop`、`/demo` 仍然正常；
+2. 两个开关都设成 `0` 后，`:8080` 的 `/shop`、`/demo` 返回 404（证明真的让位了）；
+3. `:8086/shop`、`:8086/shop/data` 返回 200；`:8087/demo`、`:8087/demo/data` 返回 200；
+4. 经网关 `:8081` 访问 `/shop`、`/shop/data`、`/demo`、`/demo/data` 都是 200；
+5. 直连 `:8086/shop/my` 且不带 token / `X-User-Id` 时返回 401；经网关带登录 token 后返回 200；
+6. 独立控制台执行 `/demo/seed`，能跨服务建出商品、库存、秒杀活动和演示账号，并完成 Redis 预热；
+7. 秒杀主链路不受影响：抢购、Kafka 落库、超时关单和对账仍然正常；
+8. 同一个 `X-Trace-Id` 能从网关串到 shop / console，再串到它们调用的下游服务；
+9. `gofmt -l cmd internal` 无输出，`go vet ./...` 和 `go build ./...` 通过。
+
+### 18.8 已知风险
+
+- **页面里的请求是相对路径**。例如页面会去调 `/login`、`/cart/items`、`/shop/data`。
+  经网关打开页面时一切正常；直接打开 `http://127.0.0.1:8086/shop` 虽然能看到页面，
+  但页面里的业务请求会打到 shop 自己，可能得到 404。
+  这是「页面服务只负责发页面」的必然结果，不能靠给 shop / console 加全量反向代理掩盖。
+- **shop / console 不拥有数据**。它们一旦连不上下游，页面会报错，但不会破坏业务数据。
+- **内部接口没有额外鉴权**。当前只靠「网关不认识 `/internal` 前缀」隔离；
+  真上线必须改成只监听内网、加 IP 白名单或服务间认证。
+- **HTTP 客户端超时是必须的**。不设超时，一个下游卡住就会把页面请求一直挂住。
+
+### 18.9 HTTP 客户端的正确实现
+
+两个独立服务各有一个通用的 `do(...)`，它只做一件事：替页面服务给兄弟服务打电话。
+这里最容易犯的不是「不会发请求」，而是把请求和响应接反：
+
+- 请求体必须作为 `http.Request.Body` 发给下游。只把 JSON 写进一个名叫 `body` 的请求头，
+  下游仍然会收到一个空请求体，`POST /register`、`POST /seckill/activities` 会直接返回 400；
+- 响应必须从 `resp.Body` 读出来再解析。拿请求序列化后的字节去 `json.Unmarshal`，
+  GET 时它通常是空切片，结果就是 `unexpected end of JSON input`；
+- 拿到 `resp` 后必须 `defer resp.Body.Close()`。即使内容已经读完，也要归还连接资源；
+- 响应最多读 64KB，防止一个失控的下游用超大响应把本服务内存吃掉。
+
+最终两份实现统一按这个顺序：
+
+1. `body != nil` 时先 `json.Marshal`，再用 `bytes.NewReader` 作为请求体；
+2. `http.NewRequestWithContext(ctx, method, url, reader)` 构造请求；
+3. 有请求体时设置 `Content-Type: application/json`；
+4. 把 `trace.FromContext(ctx)` 写进 `X-Trace-Id`；
+5. `c.client.Do(req)`，然后 `defer resp.Body.Close()`；
+6. 用 `io.LimitReader(resp.Body, 64<<10)` 读取响应；
+7. 非 2xx 保留状态码和响应体。`shop` 返回可读错误，`console` 返回 `statusError`，
+   后者让 409「用户名已存在」可以翻译成正常业务结果；
+8. 2xx 且 `out != nil` 时，把**响应字节**解析到 `out`。
+
+两个包各补了单元测试，覆盖 POST 请求体确实到达下游、Content-Type、trace 透传、
+正常 JSON 解析、非 2xx 状态保留，以及响应体关闭。
+
+### 18.10 实测记录（2026-10-26）
+
+- **单体开关**：`SHOP_MODULE=0` / `CONSOLE_MODULE=0` 时，`:8080/shop`、`:8080/demo` 都是 **404**；
+  不设这两个变量时，两者都是 **200**，本地适配器回退路径有效。
+- **独立页面与取数**：`:8086/shop`、`:8086/shop/data`、`:8087/demo`、`:8087/demo/data`
+  全部 **200**；经网关 `:8081` 访问同样四个路径也全部 **200**。
+- **鉴权**：`:8086/shop/my` 和 `:8081/shop/my` 不带 token 都是 **401**；登录 `demo1` 后
+  经网关返回 **200**，证明网关注入的 `X-User-Id` 能被独立前台正确使用。
+- **跨服务造数**：独立控制台 `POST /demo/seed` 返回 **200**，建成活动 `33`、
+  4 个秒杀商品和 3 个演示账号，秒杀商品 `56` 的 Redis 剩余库存为 **30**。
+- **秒杀主链路**：经网关抢 item `56` 返回 `queued`；等待 Kafka 落库后，
+  同一个 `request_id` 出现在 `/shop/my`，Redis 剩余 **30 → 29**、MySQL `sold` **0 → 1**。
+- **trace**：`stage18-gw-console-trace` 同时出现在网关和下游用户服务日志；
+  `stage18-error-chain` 从网关贯穿到商品服务。单元测试另外验证了两个 HTTP 客户端会继续透传 trace。
+- **三件套与测试**：`gofmt -l cmd internal` 无输出；`go test -count=1 ./...`、
+  `go vet ./...`、`go build ./...` 全部通过。
+
 ## 8. 挖空式协作规则
 
 - 编码代理搭好骨架，留出关键函数或逻辑的“空”，让用户动手填写。

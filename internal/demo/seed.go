@@ -1,6 +1,7 @@
 package demo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -147,6 +148,7 @@ func (h *Handler) Seed(c *gin.Context) {
 	// 开始时间往前挪 5 分钟，避免「刚建好却提示还没开始」。
 	now := time.Now()
 	activity, err := h.seckill.CreateActivity(
+		ctx,
 		"演示秒杀专场 "+now.Format("01-02 15:04"),
 		now.Add(-5*time.Minute),
 		now.Add(2*time.Hour),
@@ -160,19 +162,19 @@ func (h *Handler) Seed(c *gin.Context) {
 	// 任何一个商品失败都直接返回：留一半数据在现场更难解释。
 	seeded := make([]seededItem, 0, len(demoProducts))
 	for _, dp := range demoProducts {
-		prod, err := h.ensureProduct(dp)
+		prod, err := h.ensureProduct(ctx, dp)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建商品失败: " + err.Error()})
 			return
 		}
 
-		sku, err := h.ensureSKU(prod.ID, dp)
+		sku, err := h.ensureSKU(ctx, prod.ID, dp)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建 SKU 失败: " + err.Error()})
 			return
 		}
 
-		if err := h.ensureStock(sku.ID); err != nil {
+		if err := h.ensureStock(ctx, sku.ID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建库存失败: " + err.Error()})
 			return
 		}
@@ -182,7 +184,7 @@ func (h *Handler) Seed(c *gin.Context) {
 			stock = req.TotalStock
 		}
 
-		item, err := h.seckill.CreateItem(activity.ID, sku.ID, dp.SeckillPrice, stock, dp.PerUserLimit)
+		item, err := h.seckill.CreateItem(ctx, activity.ID, sku.ID, dp.SeckillPrice, stock, dp.PerUserLimit)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建秒杀商品失败: " + err.Error()})
 			return
@@ -206,7 +208,7 @@ func (h *Handler) Seed(c *gin.Context) {
 		})
 	}
 
-	usernames, err := h.ensureUsers(req.UserCount)
+	usernames, err := h.ensureUsers(ctx, req.UserCount)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建演示账号失败: " + err.Error()})
 		return
@@ -240,8 +242,8 @@ func (h *Handler) Seed(c *gin.Context) {
 // ensureProduct 找到演示商品，找不到才建。
 // 商品模块没有「按名字查」的接口，所以用 List 全量取回来在内存里比一遍——
 // 演示数据的数据量很小，这样写最省事，也不用为此再给商品模块加接口。
-func (h *Handler) ensureProduct(dp demoProduct) (*product.Product, error) {
-	products, err := h.products.List()
+func (h *Handler) ensureProduct(ctx context.Context, dp demoProduct) (*product.Product, error) {
+	products, err := h.products.List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -252,12 +254,12 @@ func (h *Handler) ensureProduct(dp demoProduct) (*product.Product, error) {
 		}
 	}
 
-	return h.products.Create(dp.Name, dp.Description, dp.Price)
+	return h.products.CreateProduct(ctx, dp.Name, dp.Description, dp.Price)
 }
 
 // ensureSKU 找到「这个商品 + 这个规格」的 SKU，找不到才建。
-func (h *Handler) ensureSKU(productID uint, dp demoProduct) (*product.SKU, error) {
-	sku, err := h.products.FindSKUByProductAndSpec(productID, dp.Spec)
+func (h *Handler) ensureSKU(ctx context.Context, productID uint, dp demoProduct) (*product.SKU, error) {
+	sku, err := h.products.FindSKUByProductAndSpec(ctx, productID, dp.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -265,14 +267,14 @@ func (h *Handler) ensureSKU(productID uint, dp demoProduct) (*product.SKU, error
 		return sku, nil
 	}
 
-	return h.products.CreateSKU(productID, dp.Spec, dp.SKUPrice)
+	return h.products.CreateSKU(ctx, productID, dp.Spec, dp.SKUPrice)
 }
 
 // ensureStock 保证 SKU 有一条库存记录。
 // 库存模块的 Get 在没有记录时返回 ErrStockNotFound，用 errors.Is 判断，
 // 而不是拿错误字符串去比——字符串是会变的，错误值不会。
-func (h *Handler) ensureStock(skuID uint) error {
-	_, err := h.stocks.Get(skuID)
+func (h *Handler) ensureStock(ctx context.Context, skuID uint) error {
+	_, err := h.stocks.Get(ctx, skuID)
 	if err == nil {
 		return nil
 	}
@@ -281,7 +283,7 @@ func (h *Handler) ensureStock(skuID uint) error {
 	}
 
 	// 给一个很大的数：这个库存是给普通下单链路用的，跟秒杀库存（seckill_items.total_stock）是两码事。
-	_, err = h.stocks.Create(skuID, 100000)
+	_, err = h.stocks.CreateStock(ctx, skuID, 100000)
 	return err
 }
 
@@ -290,13 +292,13 @@ func (h *Handler) ensureStock(skuID uint) error {
 // 为什么用「注册」而不是直接往数据库塞用户：注册接口会做密码哈希，
 // 直接塞明文密码进去，之后是登不上的。复用注册逻辑就不会有这个问题。
 // 账号已经存在时会返回 ErrUsernameTaken，这不是错误——说明上次已经建好了，跳过即可。
-func (h *Handler) ensureUsers(count int) ([]string, error) {
+func (h *Handler) ensureUsers(ctx context.Context, count int) ([]string, error) {
 	usernames := make([]string, 0, count)
 
 	for i := 1; i <= count; i++ {
 		username := fmt.Sprintf("demo%d", i)
 
-		_, err := h.users.Register(username, demoPassword)
+		_, err := h.users.Register(ctx, username, demoPassword)
 		if err != nil && !errors.Is(err, user.ErrUsernameTaken) {
 			return nil, fmt.Errorf("注册 %s 失败: %w", username, err)
 		}

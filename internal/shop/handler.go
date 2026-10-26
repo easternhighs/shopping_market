@@ -7,10 +7,11 @@
 // 两个页面看到的是同一套后端、同一条抢购链路，只是站的视角不同。
 //
 // 它同样是一个「组装者」：自己不碰任何数据库表，只把 product 和 seckill
-// 两个模块已经对外提供的能力拼起来。所以这里注入的是 Service，而不是 *gorm.DB——
-// 这样前台怎么改，都不会把业务模块之间的依赖关系搞乱。
+// 两个模块已经对外提供的能力拼起来。阶段 18 起，这里注入的不再是具体的 Service，
+// 而是两个只读接口：单体模式由本地适配器实现，独立进程由 HTTP 客户端实现。
+// 页面组装逻辑因此完全不用关心数据是「函数调用」还是「网络请求」回来的。
 //
-// 对外提供四条路由：
+// 对外提供五条路由：
 //
 //	GET /shop          商品列表页（静态 HTML，用 go:embed 打进二进制）
 //	GET /shop/seckill  秒杀独立页（静态 HTML）
@@ -61,12 +62,12 @@ const contextUserID = "userID"
 
 // Handler 是独立前台的 HTTP 层。
 type Handler struct {
-	products *product.Service
-	seckill  *seckill.Service
+	products ProductReader
+	seckill  SeckillReader
 }
 
 // NewHandler 创建前台 HTTP 层。
-func NewHandler(products *product.Service, seckillService *seckill.Service) *Handler {
+func NewHandler(products ProductReader, seckillService SeckillReader) *Handler {
 	return &Handler{products: products, seckill: seckillService}
 }
 
@@ -164,7 +165,7 @@ func (h *Handler) Data(c *gin.Context) {
 	// skuID → 商品ID、商品ID → 商品名。
 	// 为什么要建表：秒杀商品记录里只有 SKU ID，前台却要显示「这是哪个商品」，
 	// 有对照表就不用为了显示一个名字再多查一次数据库。
-	products, err := h.products.List()
+	products, err := h.products.List(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -178,7 +179,7 @@ func (h *Handler) Data(c *gin.Context) {
 		productIDs = append(productIDs, p.ID)
 	}
 
-	allSKUs, err := h.products.ListSKUsByProductIDs(productIDs)
+	allSKUs, err := h.products.ListSKUsByProductIDs(ctx, productIDs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -215,7 +216,7 @@ func (h *Handler) Data(c *gin.Context) {
 	// 第 2 步：挑出「当前该展示的那场秒杀」。
 	// 优先选还没结束、且最近建的一场；如果全都结束了，就退回展示最新的一场，
 	// 这样页面不会因为活动过期突然变成空白，而是显示「活动已结束」。
-	activities, err := h.seckill.ListActivities()
+	activities, err := h.seckill.ListActivities(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -242,11 +243,20 @@ func (h *Handler) Data(c *gin.Context) {
 	seckillBySKU := make(map[uint]uint)
 
 	if current != nil {
-		items, err := h.seckill.ListItems(current.ID)
+		items, err := h.seckill.ListItems(ctx, current.ID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+
+		// 付款时限在一轮页面数据里只需要取一次。以前写在商品循环里，
+		// 有几个秒杀商品就要调几次；拆成 HTTP 接口后那会变成多次网络往返。
+		payTimeout, err := h.seckill.PayTimeout(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		payTimeoutSeconds := int(payTimeout.Seconds())
 
 		for _, item := range items {
 			remaining, ready, err := h.seckill.RemainingStock(ctx, item.ID)
@@ -268,7 +278,7 @@ func (h *Handler) Data(c *gin.Context) {
 				EndAt:        current.EndAt,
 				StockReady:   ready,
 
-				PayTimeoutSeconds: int(h.seckill.PayTimeout().Seconds()),
+				PayTimeoutSeconds: payTimeoutSeconds,
 			}
 			if ready {
 				view.RemainingStock = &remaining
@@ -320,7 +330,7 @@ func (h *Handler) Data(c *gin.Context) {
 func (h *Handler) MyOrders(c *gin.Context) {
 	userID := c.GetUint(contextUserID)
 
-	orders, err := h.seckill.ListUserOrders(userID)
+	orders, err := h.seckill.ListUserOrders(c.Request.Context(), userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
