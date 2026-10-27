@@ -12,6 +12,7 @@
   - **鉴权与造数**：`/shop/my` 直连和经网关不带 token 都是 **401**，登录 `demo1` 后经网关 **200**；独立控制台 `/demo/seed` 跨服务建成活动 `33`、4 个秒杀商品和 3 个演示账号，首个秒杀商品 `56` 的 Redis 剩余库存为 **30**
   - **主链路**：经网关抢 item `56` 返回 `queued`，Kafka 落库后 `/shop/my` 能查到同一 `request_id`，Redis 剩余从 **30** 变成 **29**、MySQL `sold` 从 **0** 变成 **1**
   - **trace**：`stage18-gw-console-trace` 同时出现在网关日志和下游用户服务日志；商品错误链路的 `stage18-error-chain` 也从网关贯穿到商品服务。单元测试另外断言了 HTTP 客户端会把 trace 继续传给下游
+  - **数据清理**：删除验证产生的活动 `33` / `34`、秒杀商品 `56`～`63` 和测试订单 `id=2`；对应 Redis 库存 / 商品缓存 / 请求 key、用户限购 key 与延时队列成员全部删除。商品 `12`～`15`、SKU `13`～`16` 创建于阶段 18 之前，已保留
   - **校验**：`gofmt -l cmd internal` 无输出、`go test -count=1 ./...`、`go vet ./...`、`go build ./...` 全部通过；四个新增/修改文件均为 LF、无 BOM
 - 上一轮完成：**拆出 `cmd/order`（订单 + 购物车 + 支付），单体加 `ORDER_MODULE` 开关**（阶段 17 完成）
   - 搬家：新增 `cmd/order`（默认 `:8085`），`internal/order` + `internal/cart` + `internal/payment` 三块一起搬过去；`AutoMigrate` 六张表（`orders` / `order_items` / `order_outbox` / `carts` / `cart_items` / `payments`）；全部路由挂鉴权；库存补偿 `RetryLoop` 跟着搬到这个进程；`Makefile` 补 `run-order` / `build-order`

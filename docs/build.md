@@ -1640,6 +1640,9 @@ go run ./cmd/gateway
   同一个 `request_id` 出现在 `/shop/my`，Redis 剩余 **30 → 29**、MySQL `sold` **0 → 1**。
 - **trace**：`stage18-gw-console-trace` 同时出现在网关和下游用户服务日志；
   `stage18-error-chain` 从网关贯穿到商品服务。单元测试另外验证了两个 HTTP 客户端会继续透传 trace。
+- **数据清理**：删除活动 `33` / `34`、秒杀商品 `56`～`63` 和测试订单 `id=2`；
+  对应 Redis 缓存、用户限购 key 与延时队列成员一并删除，复核结果全部为 0。
+  商品 `12`～`15` 与 SKU `13`～`16` 是更早创建的基础演示数据，未删除。
 - **三件套与测试**：`gofmt -l cmd internal` 无输出；`go test -count=1 ./...`、
   `go vet ./...`、`go build ./...` 全部通过。
 
